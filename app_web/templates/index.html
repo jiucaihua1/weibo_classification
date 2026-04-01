@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>微博兴趣分类看板</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; background: #f8f9fb; }
+    .card { background: #fff; border-radius: 8px; padding: 16px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    table { width: 100%; border-collapse: collapse; background: #fff; }
+    th, td { border-bottom: 1px solid #eee; text-align: left; padding: 10px; font-size: 14px; }
+    .tag { display: inline-block; background: #eef3ff; color: #2f5bd8; border-radius: 999px; padding: 2px 8px; }
+    a { color: #2f5bd8; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <h1>微博兴趣分类 MVP</h1>
+  <div class="card">
+    <h3>微博数据与建模（可分步）</h3>
+    <p style="color:#666;font-size:14px;">先「抓取微博」生成 <code>output/weibo_crawl_latest.json</code>（用户按输入顺序排列）；再「训练并生成画像」读取该文件做聚类与推断。</p>
+    <form id="run-form">
+      <p><label>用户ID（逗号分隔多个）: <input name="user_id" value="{{ default_user_id }}" required style="width:100%;"></label></p>
+      <p><label>Cookie（仅抓取需要）:</label><br><textarea name="cookie" rows="4" style="width:100%;"></textarea></p>
+      <p>
+        <details open>
+          <summary><strong>热搜活跃用户（评论者为主，更接近自然分布）</strong></summary>
+          <p style="color:#666;font-size:13px;margin:6px 0 0 0;">完成后仅保留 UID 列表与汇总/调试 JSON；中间爬虫文件会自动清理（若仍见旧文件，多为历史残留，可点「清理 output」）。</p>
+          <div style="margin-top:10px;">
+            <label>热搜词数量: <input id="hs-hotword-limit" type="number" value="10" min="1" style="width:70px;"></label>
+            <label>每个热搜抓取用户数: <input id="hs-commenters-per-kw" type="number" value="30" min="1" style="width:110px;"></label>
+            <label>总UID上限: <input id="hs-total" type="number" value="200" min="2" style="width:80px;"></label>
+            <label>速度模式:
+              <select id="hs-speed-mode">
+                <option value="steady" selected>稳妥档</option>
+                <option value="fast">极速档</option>
+              </select>
+            </label>
+            <div style="margin-top:8px;">
+              <button type="button" id="hot-sample">热搜采样并填入UID</button>
+              <span id="hs-result" style="color:#666;"></span>
+            </div>
+          </div>
+        </details>
+      </p>
+      <p>
+        <label>聚类数（训练用）: <input name="clusters" type="number" value="2" min="1"></label>
+        <label>最大页数（抓取用）: <input name="max_pages" type="number" value="1" min="1"></label>
+      </p>
+      <p>
+        <label>请求间隔: <input name="download_delay" type="number" value="0.2" step="0.1" min="0"></label>
+        <label>并发: <input name="concurrent_requests" type="number" value="8" min="1"></label>
+        <label>重试: <input name="retry_times" type="number" value="2" min="0"></label>
+      </p>
+      <p>
+        <button type="button" id="btn-crawl">1. 抓取微博（生成 JSON）</button>
+        <button type="button" id="btn-train">2. 训练并生成画像</button>
+      </p>
+    </form>
+    <p id="job-status">状态: idle</p>
+    <pre id="job-logs" style="background:#111;color:#ddd;padding:12px;border-radius:8px;max-height:220px;overflow:auto;"></pre>
+  </div>
+  <div class="card">
+    <h3>本地清理</h3>
+    <button type="button" id="cleanup-output">清理 output（保留 ml_artifacts）</button>
+    <span id="cleanup-result" style="color:#666;"></span>
+  </div>
+  <div class="card">
+    <h3>热搜采样调试</h3>
+    <button type="button" id="hot-debug-refresh">查看最近调试摘要</button>
+    <span id="hot-debug-meta" style="color:#666;"></span>
+    <pre id="hot-debug-content" style="background:#111;color:#ddd;padding:12px;border-radius:8px;max-height:260px;overflow:auto;"></pre>
+  </div>
+  <div class="card">
+    <h3>类别占比</h3>
+    {% if interest_distribution %}
+      <ul>
+      {% for k, v in interest_distribution.items() %}
+        <li>{{ k }}: {{ v }}</li>
+      {% endfor %}
+      </ul>
+    {% else %}
+      <p>暂无数据，请先运行建模与推断流程。</p>
+    {% endif %}
+  </div>
+  <div class="card">
+    <h3>用户画像列表</h3>
+    <table>
+      <thead>
+        <tr><th>用户</th><th>Top1 兴趣</th><th>样本数</th><th>来源统计</th><th>详情</th></tr>
+      </thead>
+      <tbody>
+      {% for p in profiles %}
+        {% set u = user_infos.get(p.user_id, {}) %}
+        <tr>
+          <td>
+            <div><strong>{{ u.nick_name or p.user_id }}</strong></div>
+            <div style="color:#666;font-size:12px;">{{ p.user_id }}{% if u.followers_count is not none %} | 粉丝 {{ u.followers_count }}{% endif %}</div>
+          </td>
+          <td><span class="tag">{{ p.top_interest }}</span></td>
+          <td>{{ p.sample_size }}</td>
+          <td>{{ p.source_stats }}</td>
+          <td><a href="/users/{{ p.user_id }}">查看</a></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <script>
+    const form = document.getElementById("run-form");
+    form.addEventListener("submit", (e) => e.preventDefault());
+    const userIdInput = form.querySelector('input[name="user_id"]');
+    const cookieInput = form.querySelector('textarea[name="cookie"]');
+    const hsBtn = document.getElementById("hot-sample");
+    const hsResult = document.getElementById("hs-result");
+    const hsHotwordLimit = document.getElementById("hs-hotword-limit");
+    const hsCommentersPerKw = document.getElementById("hs-commenters-per-kw");
+    const hsTotal = document.getElementById("hs-total");
+    const hsSpeedMode = document.getElementById("hs-speed-mode");
+    const cleanupBtn = document.getElementById("cleanup-output");
+    const cleanupResult = document.getElementById("cleanup-result");
+    const hotDebugBtn = document.getElementById("hot-debug-refresh");
+    const hotDebugMeta = document.getElementById("hot-debug-meta");
+    const hotDebugContent = document.getElementById("hot-debug-content");
+    const btnCrawl = document.getElementById("btn-crawl");
+    const btnTrain = document.getElementById("btn-train");
+    const statusEl = document.getElementById("job-status");
+    const logsEl = document.getElementById("job-logs");
+    let timer = null;
+
+    async function pollJob(jobId, reloadOnDone) {
+      const resp = await fetch(`/api/jobs/${jobId}`);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      statusEl.textContent = `状态: ${data.status}${data.error ? " | " + data.error : ""}`;
+      logsEl.textContent = (data.logs || []).join("\n");
+      logsEl.scrollTop = logsEl.scrollHeight;
+      if (data.status === "completed" || data.status === "failed") {
+        clearInterval(timer);
+        timer = null;
+        if (data.status === "completed" && reloadOnDone) setTimeout(() => location.reload(), 800);
+      }
+    }
+
+    function startJob(url, body, reloadOnDone) {
+      statusEl.textContent = "状态: submitting...";
+      logsEl.textContent = "";
+      fetch(url, { method: "POST", body }).then(async (resp) => {
+        const data = await resp.json();
+        if (!resp.ok) {
+          statusEl.textContent = `状态: failed | ${data.error || "submit failed"}`;
+          return;
+        }
+        statusEl.textContent = `状态: queued | job=${data.job_id}`;
+        if (timer) clearInterval(timer);
+        timer = setInterval(() => pollJob(data.job_id, reloadOnDone), 1500);
+        pollJob(data.job_id, reloadOnDone);
+      });
+    }
+
+    btnCrawl.addEventListener("click", () => {
+      const fd = new FormData();
+      fd.append("user_id", form.querySelector('input[name="user_id"]').value || "");
+      fd.append("cookie", cookieInput.value || "");
+      fd.append("max_pages", form.querySelector('input[name="max_pages"]').value || "1");
+      fd.append("download_delay", form.querySelector('input[name="download_delay"]').value || "0.2");
+      fd.append("concurrent_requests", form.querySelector('input[name="concurrent_requests"]').value || "8");
+      fd.append("retry_times", form.querySelector('input[name="retry_times"]').value || "2");
+      if (!fd.get("user_id") || !String(fd.get("user_id")).trim()) {
+        statusEl.textContent = "请填写用户ID";
+        return;
+      }
+      if (!fd.get("cookie") || !String(fd.get("cookie")).trim()) {
+        statusEl.textContent = "抓取需要填写 Cookie";
+        return;
+      }
+      startJob("/api/crawl_weibo", fd, true);
+    });
+
+    btnTrain.addEventListener("click", () => {
+      const fd = new FormData();
+      fd.append("clusters", form.querySelector('input[name="clusters"]').value || "2");
+      startJob("/api/train", fd, true);
+    });
+
+    hsBtn.addEventListener("click", async () => {
+      hsResult.textContent = "已提交热搜采样任务，执行中...";
+      const fd = new FormData();
+      fd.append("cookie", cookieInput.value || "");
+      fd.append("hotword_limit", String(parseInt(hsHotwordLimit.value || "10")));
+      fd.append("commenters_per_keyword", String(parseInt(hsCommentersPerKw.value || "30")));
+      fd.append("total_uid_limit", String(parseInt(hsTotal.value || "200")));
+      fd.append("speed_mode", hsSpeedMode.value || "steady");
+      const resp = await fetch("/api/hot_search_sample", { method: "POST", body: fd });
+      const data = await resp.json();
+      if (!resp.ok) {
+        hsResult.textContent = `失败：${data.error || "unknown"}`;
+        return;
+      }
+      const jobId = data.job_id;
+      const poll = async () => {
+        const jr = await fetch(`/api/jobs/${jobId}`);
+        if (!jr.ok) return;
+        const jd = await jr.json();
+        hsResult.textContent = `热搜采样状态：${jd.status}`;
+        if (jd.status === "completed") {
+          const uids = (jd.result && jd.result.user_ids) ? jd.result.user_ids : [];
+          userIdInput.value = uids.join(",");
+          const dbg = (jd.result && jd.result.debug_file) ? jd.result.debug_file : "";
+          hsResult.textContent = `完成：生成 UID ${uids.length} 个，已填入 user_id${dbg ? " | 调试日志已生成" : ""}`;
+        }
+        if (jd.status === "failed") hsResult.textContent = `失败：${jd.error || "unknown"}`;
+        if (jd.status !== "completed" && jd.status !== "failed") setTimeout(poll, 1500);
+      };
+      poll();
+    });
+
+    cleanupBtn.addEventListener("click", async () => {
+      cleanupResult.textContent = "正在清理...";
+      const fd = new FormData();
+      fd.append("keep_ml_artifacts", "1");
+      const resp = await fetch("/api/cleanup_output", { method: "POST", body: fd });
+      const data = await resp.json();
+      if (!resp.ok) {
+        cleanupResult.textContent = `失败：${data.error || "unknown"}`;
+        return;
+      }
+      cleanupResult.textContent = `完成：删除文件 ${data.removed_files}，删除目录 ${data.removed_dirs}`;
+      setTimeout(() => location.reload(), 500);
+    });
+
+    hotDebugBtn.addEventListener("click", async () => {
+      hotDebugMeta.textContent = "加载中...";
+      hotDebugContent.textContent = "";
+      const resp = await fetch("/api/hot_search_debug_latest");
+      const data = await resp.json();
+      if (!resp.ok) {
+        hotDebugMeta.textContent = `失败：${data.error || "unknown"}`;
+        return;
+      }
+      const s = data.summary || {};
+      hotDebugMeta.textContent = `文件：${data.path}`;
+      const lines = [];
+      lines.push(`总关键词: ${s.keywords} | 最终UID: ${s.total_unique_uids}`);
+      lines.push(`零微博关键词: ${s.zero_tweet_keywords} | 零评论候选关键词: ${s.zero_commenter_keywords}`);
+      lines.push(`评论总行数: ${s.total_comment_rows} | 评论唯一候选总数: ${s.total_comment_unique_candidates} | 全局重复抽中: ${s.global_duplicate_picks}`);
+      lines.push("");
+      (data.by_keyword || []).forEach((k) => {
+        const cs = k.comment_extract_stats || {};
+        const inter = (k.interaction_candidates_unique !== undefined) ? k.interaction_candidates_unique : (k.commenter_candidates_unique || 0);
+        lines.push(
+          `[${k.keyword_index}] ${k.keyword} | tweet=${k.tweet_ids_collected} authors=${k.tweet_authors_unique || 0} comments=${k.commenter_candidates_unique} pool=${inter} picked=${k.picked_actual} add=${k.added_to_global_unique} dup_global=${k.picked_but_duplicate_globally} comment_rows=${cs.comment_rows || 0} dup_in_kw=${cs.duplicate_uid_rows || 0}`
+        );
+      });
+      hotDebugContent.textContent = lines.join("\n");
+    });
+  </script>
+</body>
+</html>

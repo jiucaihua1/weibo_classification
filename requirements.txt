@@ -1,0 +1,12 @@
+Scrapy==2.5.1
+python_dateutil
+cryptography==36.0.2
+pyOpenSSL==22.0.0
+Twisted==22.10.0
+fastapi
+uvicorn
+jinja2
+python-multipart
+scikit-learn
+jieba
+numpy

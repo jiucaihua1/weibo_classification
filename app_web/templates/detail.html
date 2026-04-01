@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>用户兴趣详情</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; background: #f8f9fb; }
+    .card { background: #fff; border-radius: 8px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    a { color: #2f5bd8; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <p><a href="/">返回看板</a></p>
+  <div class="card">
+    <h2>用户 {{ user_info.nick_name or profile.user_id }} <span style="color:#666;font-size:14px;">({{ profile.user_id }})</span></h2>
+    {% if user_info.description %}<p style="color:#333;">{{ user_info.description }}</p>{% endif %}
+    <p style="color:#666;">
+      {% if user_info.followers_count is not none %}粉丝 {{ user_info.followers_count }}{% endif %}
+      {% if user_info.friends_count is not none %} | 关注 {{ user_info.friends_count }}{% endif %}
+      {% if user_info.statuses_count is not none %} | 微博 {{ user_info.statuses_count }}{% endif %}
+      {% if user_info.location %} | {{ user_info.location }}{% endif %}
+    </p>
+    <p>Top1 兴趣: <strong>{{ profile.top_interest }}</strong></p>
+    <p>聚类 ID: {{ profile.cluster_id }}</p>
+    <p>样本数: {{ profile.sample_size }}</p>
+    <p>来源统计: {{ profile.source_stats }}</p>
+    <h3>兴趣得分</h3>
+    <pre>{{ profile.interest_scores }}</pre>
+    <h3>分类依据（来源内容示例）</h3>
+    {% if profile.evidence %}
+      <ol>
+      {% for r in profile.evidence %}
+        <li style="margin-bottom:10px;">
+          <div><strong>{{ r.source_type }}</strong> | {{ r.created_at }} {% if r.url %}| <a href="{{ r.url }}" target="_blank">原链接</a>{% endif %}</div>
+          <div style="white-space:pre-wrap;">{{ r.text }}</div>
+        </li>
+      {% endfor %}
+      </ol>
+    {% else %}
+      <p>暂无证据数据（请重新运行推断生成 evidence 字段）。</p>
+    {% endif %}
+  </div>
+</body>
+</html>
