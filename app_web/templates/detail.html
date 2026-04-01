@@ -3,43 +3,133 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>用户兴趣详情</title>
+  <title>用户兴趣详情 · {{ profile.user_id }}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/@tabler/core@latest/dist/css/tabler.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/tabler-icons.min.css" rel="stylesheet">
   <style>
-    body { font-family: Arial, sans-serif; margin: 24px; background: #f8f9fb; }
-    .card { background: #fff; border-radius: 8px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
-    a { color: #2f5bd8; text-decoration: none; }
+    body {
+      font-family: "Noto Sans SC", system-ui, sans-serif;
+    }
   </style>
 </head>
 <body>
-  <p><a href="/">返回看板</a></p>
-  <div class="card">
-    <h2>用户 {{ user_info.nick_name or profile.user_id }} <span style="color:#666;font-size:14px;">({{ profile.user_id }})</span></h2>
-    {% if user_info.description %}<p style="color:#333;">{{ user_info.description }}</p>{% endif %}
-    <p style="color:#666;">
-      {% if user_info.followers_count is not none %}粉丝 {{ user_info.followers_count }}{% endif %}
-      {% if user_info.friends_count is not none %} | 关注 {{ user_info.friends_count }}{% endif %}
-      {% if user_info.statuses_count is not none %} | 微博 {{ user_info.statuses_count }}{% endif %}
-      {% if user_info.location %} | {{ user_info.location }}{% endif %}
-    </p>
-    <p>Top1 兴趣: <strong>{{ profile.top_interest }}</strong></p>
-    <p>聚类 ID: {{ profile.cluster_id }}</p>
-    <p>样本数: {{ profile.sample_size }}</p>
-    <p>来源统计: {{ profile.source_stats }}</p>
-    <h3>兴趣得分</h3>
-    <pre>{{ profile.interest_scores }}</pre>
-    <h3>分类依据（来源内容示例）</h3>
-    {% if profile.evidence %}
-      <ol>
-      {% for r in profile.evidence %}
-        <li style="margin-bottom:10px;">
-          <div><strong>{{ r.source_type }}</strong> | {{ r.created_at }} {% if r.url %}| <a href="{{ r.url }}" target="_blank">原链接</a>{% endif %}</div>
-          <div style="white-space:pre-wrap;">{{ r.text }}</div>
-        </li>
-      {% endfor %}
-      </ol>
-    {% else %}
-      <p>暂无证据数据（请重新运行推断生成 evidence 字段）。</p>
-    {% endif %}
+  <div class="page">
+    <aside class="navbar navbar-vertical navbar-expand-lg" data-bs-theme="dark">
+      <div class="container-fluid">
+        <h1 class="navbar-brand navbar-brand-autodark">
+          <a href="/" class="text-decoration-none">
+            <i class="ti ti-chart-dots-2 me-2"></i> 微博兴趣看板
+          </a>
+        </h1>
+        <div class="collapse navbar-collapse" id="sidebar-menu">
+          <ul class="navbar-nav pt-lg-3">
+            <li class="nav-item">
+              <a class="nav-link" href="/">
+                <span class="nav-link-icon d-md-none d-lg-inline-block"><i class="ti ti-home"></i></span>
+                <span class="nav-link-title">返回 Dashboard</span>
+              </a>
+            </li>
+            <li class="nav-item">
+              <a class="nav-link active" href="#">
+                <span class="nav-link-icon d-md-none d-lg-inline-block"><i class="ti ti-user"></i></span>
+                <span class="nav-link-title">用户详情</span>
+              </a>
+            </li>
+          </ul>
+        </div>
+      </div>
+    </aside>
+
+    <div class="page-wrapper">
+      <div class="page-header d-print-none">
+        <div class="container-xl">
+          <div class="row g-2 align-items-center">
+            <div class="col">
+              <div class="page-pretitle">User</div>
+              <h2 class="page-title">{{ user_info.nick_name or profile.user_id }}</h2>
+              <div class="text-secondary font-monospace">{{ profile.user_id }}</div>
+            </div>
+            <div class="col-auto ms-auto">
+              <span class="badge bg-azure-lt">{{ profile.top_interest }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="page-body">
+        <div class="container-xl">
+          <div class="row row-cards">
+            <div class="col-12">
+              <div class="card">
+                <div class="card-body">
+                  {% if user_info.description %}
+                    <div class="text-secondary mb-3">{{ user_info.description }}</div>
+                  {% endif %}
+                  <div class="d-flex flex-wrap gap-3 small text-secondary">
+                    {% if user_info.followers_count is not none %}<span>粉丝 {{ user_info.followers_count }}</span>{% endif %}
+                    {% if user_info.friends_count is not none %}<span>关注 {{ user_info.friends_count }}</span>{% endif %}
+                    {% if user_info.statuses_count is not none %}<span>微博 {{ user_info.statuses_count }}</span>{% endif %}
+                    {% if user_info.location %}<span>{{ user_info.location }}</span>{% endif %}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="col-md-4">
+              <div class="card">
+                <div class="card-header"><h3 class="card-title">模型输出</h3></div>
+                <div class="card-body">
+                  <div class="mb-2 d-flex justify-content-between"><span class="text-secondary">聚类 ID</span><span class="font-monospace">{{ profile.cluster_id }}</span></div>
+                  <div class="mb-2 d-flex justify-content-between"><span class="text-secondary">样本数</span><span>{{ profile.sample_size }}</span></div>
+                  <div class="text-secondary small">来源统计</div>
+                  <div class="small">{{ profile.source_stats }}</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="col-md-8">
+              <div class="card">
+                <div class="card-header"><h3 class="card-title">兴趣得分</h3></div>
+                <div class="card-body">
+                  <pre class="bg-ghost rounded p-3 small mb-0">{{ profile.interest_scores }}</pre>
+                </div>
+              </div>
+            </div>
+
+            <div class="col-12">
+              <div class="card">
+                <div class="card-header"><h3 class="card-title">分类依据（内容示例）</h3></div>
+                <div class="card-body">
+                  {% if profile.evidence %}
+                    <div class="divide-y">
+                      {% for r in profile.evidence %}
+                        <div class="py-3">
+                          <div class="d-flex flex-wrap align-items-center gap-2 mb-2 small">
+                            <span class="badge bg-secondary-lt">{{ r.source_type }}</span>
+                            <span class="text-secondary">{{ r.created_at or "—" }}</span>
+                            {% if r.url %}
+                              <a href="{{ r.url }}" target="_blank" rel="noopener" class="small">原链接</a>
+                            {% endif %}
+                          </div>
+                          <div class="text-break" style="white-space: pre-wrap;">{{ r.text }}</div>
+                        </div>
+                      {% endfor %}
+                    </div>
+                  {% else %}
+                    <div class="text-secondary">暂无证据数据（请重新运行推断以生成 evidence）。</div>
+                  {% endif %}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@tabler/core@latest/dist/js/tabler.min.js"></script>
 </body>
 </html>

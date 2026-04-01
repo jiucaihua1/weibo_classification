@@ -357,8 +357,9 @@ def run_hot_search_sample_job(
                 unified_c = _pick_new_unified(before_c, after_c)
                 if unified_c:
                     commenters, comment_extract_stats = _extract_commenter_user_ids_with_stats(unified_c, limit=1000)
+            # 仅从未评论用户抽样，不包含热搜结果里的原博作者（减少营销号/蓝V占比）
             candidate_pool, pool_seen = [], set()
-            for uid in tweet_authors + commenters:
+            for uid in commenters:
                 if uid not in pool_seen:
                     pool_seen.add(uid)
                     candidate_pool.append(uid)
@@ -378,6 +379,7 @@ def run_hot_search_sample_job(
                 "tweet_ids": len(tweet_ids),
                 "commenter_candidates": len(commenters),
                 "tweet_author_candidates": len(tweet_authors),
+                "tweet_authors_excluded_from_pool": True,
                 "interaction_candidates": len(candidate_pool),
                 "picked": len(picked),
                 "newly_added": added_count,
@@ -386,6 +388,7 @@ def run_hot_search_sample_job(
             debug_items.append({
                 "keyword_index": idx,
                 "keyword": kw,
+                "uid_pool_source": "commenters_only",
                 "tweet_unified_file": unified_kw,
                 "tweet_author_stats": tweet_author_stats,
                 "comment_extract_stats": comment_extract_stats,
@@ -402,8 +405,8 @@ def run_hot_search_sample_job(
             })
             append_job_log(
                 job_id,
-                f"[{idx}/{len(hotwords)}] {kw}: tweets={len(tweet_ids)} authors={len(tweet_authors)} commenters={len(commenters)} "
-                f"pool={len(candidate_pool)} picked={len(picked)} new={added_count} dup_global={dup_in_global_seen} total={len(all_uids)}",
+                f"[{idx}/{len(hotwords)}] {kw}: tweets={len(tweet_ids)} commenters={len(commenters)} pool(commenters_only)={len(candidate_pool)} "
+                f"(authors_in_search={len(tweet_authors)} excluded) picked={len(picked)} new={added_count} dup_global={dup_in_global_seen} total={len(all_uids)}",
             )
             if total_uid_limit and len(all_uids) >= int(total_uid_limit):
                 break
@@ -425,6 +428,7 @@ def run_hot_search_sample_job(
             "params": {
                 "hotword_limit": int(hotword_limit),
                 "users_per_keyword": int(users_per_keyword),
+                "uid_pool_source": "commenters_only",
                 "total_uid_limit": int(total_uid_limit),
                 "keyword_max_pages": int(speed_profile["keyword_max_pages"]),
                 "sleep_between_keywords_sec": float(speed_profile["sleep_between_keywords_sec"]),
