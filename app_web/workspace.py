@@ -59,6 +59,8 @@ def get_workspace_state(
     train_rel = rel_posix(project_dir, crawl_json_path)
 
     cleaned_path = os.path.join(output_dir, "cleaned_user_texts.jsonl")
+    user_features_path = os.path.join(output_dir, "user_features_text2vec.npy")
+    user_ids_path = os.path.join(output_dir, "user_ids_text2vec.pkl")
 
     return {
         "default_user_id": hot_csv if hot_csv else fallback_demo_uid,
@@ -69,6 +71,8 @@ def get_workspace_state(
         "default_cookie": cookie_full,
         "crawl_bundle": file_probe(project_dir, crawl_json_path),
         "cleaned_user_texts": file_probe(project_dir, cleaned_path),
+        "user_features_text2vec": file_probe(project_dir, user_features_path),
+        "user_ids_text2vec": file_probe(project_dir, user_ids_path),
         "profiles_file": file_probe(project_dir, profile_path),
         "train_input_default": train_rel,
     }

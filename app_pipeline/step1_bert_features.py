@@ -1,20 +1,11 @@
 """
 app_pipeline/step1_bert_features.py
 
-将「TextRank 关键词抽取 + BERT(text2vec) 向量化 + Mean Pooling + 持久化」合并为一个脚本：
+把「TextRank 关键词抽取 + BERT(text2vec) 向量化 + Mean Pooling + 持久化」合成一个单文件脚本。
 
-输入：
-  - weibo_crawl_latest.json（bundle：顶层包含 users[].records[]）
-
-输出（默认写到 output/ 目录）：
-  - user_features_text2vec.npy        float32 (n_users, 768)
-  - user_ids_text2vec.pkl            list[str]，与 features 行严格一一对应
-  - step3_text2vec_meta.json         元信息/参数
-
-说明：
-  - 具体清洗/过滤/关键词抽取/BERT 编码逻辑复用 app_pipeline/feature_bert_textrank.py 的实现；
-    这里的作用是把它变成“一键可跑”的单文件脚本，避免你再单独跑 step2 + step3。
-  - GPU：默认 device='cuda'；并默认把 HF 下载镜像指向 hf-mirror.com。
+重要：此版本不做“数据清洗/过滤逻辑”。它直接读取你已有的：
+`output/cleaned_user_texts.jsonl`（由 `app_pipeline/clean_user_text.py` 产出），
+只在 cleaned_text 上做 TextRank -> text2vec -> mean pooling -> 保存用户向量。
 """
 
 from __future__ import annotations
@@ -23,11 +14,10 @@ import argparse
 import json
 import os
 import pickle
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
-
-from app_pipeline.feature_bert_textrank import FeatureExtractionConfig, extract_user_features
+import jieba.analyse
 
 
 def _project_root() -> str:
@@ -52,13 +42,152 @@ def _check_cuda(device: str) -> None:
         raise RuntimeError("torch not installed; required for device='cuda'.") from e
 
 
+def extract_user_features_from_cleaned_jsonl(
+    cleaned_input_path: str,
+    outdir: str,
+    *,
+    top_k: int = 10,
+    device: str = "cuda",
+    model_name: str = "shibing624/text2vec-base-chinese",
+    encode_batch_size: int = 64,
+    require_full_topk: bool = False,
+    max_users: Optional[int] = None,
+    hf_endpoint: str = "https://hf-mirror.com",
+) -> dict:
+    """
+    从 cleaned_user_texts.jsonl 生成 user_features_text2vec.npy / user_ids_text2vec.pkl。
+
+    重要：不做额外的数据清洗/过滤逻辑，只对 cleaned_text 做 TextRank。
+    """
+    cleaned_input_path = _resolve_path(cleaned_input_path)
+    outdir = _resolve_path(outdir)
+    os.makedirs(outdir, exist_ok=True)
+
+    if not os.path.isfile(cleaned_input_path):
+        raise FileNotFoundError(f"cleaned input not found: {cleaned_input_path}")
+
+    # Ensure HF downloads use mirror. Force-set (not setdefault) so it affects runtime init.
+    if hf_endpoint:
+        os.environ["HF_ENDPOINT"] = hf_endpoint
+        os.environ["HUGGINGFACE_HUB_BASE_URL"] = hf_endpoint
+
+    _check_cuda(device)
+
+    user_ids: List[str] = []
+    keyword_counts: List[int] = []
+    flat_keywords: List[str] = []
+
+    print(
+        f"[START] cleaned_input={cleaned_input_path}, top_k={top_k}, max_users={max_users}",
+        flush=True,
+    )
+    with open(cleaned_input_path, "rt", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            uid = str(obj.get("user_id", "")).strip()
+            cleaned_text = str(obj.get("cleaned_text", "") or "").strip()
+            if not uid or not cleaned_text:
+                continue
+
+            kws = jieba.analyse.textrank(cleaned_text, topK=top_k, withWeight=False) or []
+            kws = [str(x).strip() for x in kws if str(x).strip()]
+
+            if require_full_topk:
+                if len(kws) < top_k:
+                    continue
+                kws = kws[:top_k]
+            else:
+                kws = kws[:top_k]
+                if len(kws) <= 0:
+                    continue
+
+            user_ids.append(uid)
+            keyword_counts.append(len(kws))
+            flat_keywords.extend(kws)
+
+            if max_users is not None and len(user_ids) >= max_users:
+                break
+
+    if not user_ids:
+        raise RuntimeError("No users found in cleaned_user_texts.jsonl after keyword extraction.")
+
+    n_users = len(user_ids)
+    total_kw = len(flat_keywords)
+    print(
+        f"[STEP A] users={n_users}, total_keywords={total_kw}, require_full_topk={bool(require_full_topk)}",
+        flush=True,
+    )
+
+    # Re-import/instantiate after env variables are set.
+    from sentence_transformers import SentenceTransformer
+
+    model = SentenceTransformer(str(model_name), device=str(device))
+    print(f"[STEP B] encoding keywords batch_size={int(encode_batch_size)}", flush=True)
+    emb = model.encode(
+        flat_keywords,
+        batch_size=int(encode_batch_size),
+        show_progress_bar=True,
+        convert_to_numpy=True,
+        normalize_embeddings=False,
+    ).astype(np.float32, copy=False)
+
+    if emb.ndim != 2:
+        raise RuntimeError(f"unexpected embedding shape: {emb.shape}")
+    dim = int(emb.shape[1])
+    if emb.shape[0] != total_kw:
+        raise RuntimeError(f"embedding count mismatch: got={emb.shape[0]}, expected={total_kw}")
+
+    user_features = np.zeros((n_users, dim), dtype=np.float32)
+    start = 0
+    for i, cnt in enumerate(keyword_counts):
+        end = start + cnt
+        user_features[i] = emb[start:end].mean(axis=0)
+        start = end
+
+    # debug mode: don't overwrite full-data outputs
+    if max_users is None:
+        features_path = os.path.join(outdir, "user_features_text2vec.npy")
+        ids_path = os.path.join(outdir, "user_ids_text2vec.pkl")
+        meta_path = os.path.join(outdir, "step3_text2vec_meta.json")
+    else:
+        features_path = os.path.join(outdir, f"user_features_text2vec_max{max_users}.npy")
+        ids_path = os.path.join(outdir, f"user_ids_text2vec_max{max_users}.pkl")
+        meta_path = os.path.join(outdir, f"step3_text2vec_meta_max{max_users}.json")
+
+    np.save(features_path, user_features)
+    with open(ids_path, "wb") as f:
+        pickle.dump(user_ids, f)
+
+    meta = {
+        "cleaned_input": cleaned_input_path,
+        "output_features": features_path,
+        "output_user_ids": ids_path,
+        "n_users": int(user_features.shape[0]),
+        "top_k": int(top_k),
+        "device": str(device),
+        "model_name": str(model_name),
+        "encode_batch_size": int(encode_batch_size),
+        "require_full_topk": bool(require_full_topk),
+        "embed_dim": int(user_features.shape[1]),
+        "keyword_count_min": int(min(keyword_counts)) if keyword_counts else 0,
+        "keyword_count_max": int(max(keyword_counts)) if keyword_counts else 0,
+        "max_users": max_users,
+    }
+    with open(meta_path, "wt", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    return meta
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Single-file BERT feature extraction (TextRank -> text2vec -> mean pooling).")
     ap.add_argument(
-        "--input",
+        "--cleaned-input",
         type=str,
-        default="output/weibo_crawl_latest.json",
-        help="Path to weibo_crawl_latest.json bundle.",
+        default="output/cleaned_user_texts.jsonl",
+        help="Path to cleaned_user_texts.jsonl (generated by clean_user_text.py).",
     )
     ap.add_argument(
         "--outdir",
@@ -67,11 +196,9 @@ def main() -> None:
         help="Output directory for artifacts.",
     )
     ap.add_argument("--top-k", type=int, default=10, help="TextRank topK keywords per user.")
-    ap.add_argument("--min-chars", type=int, default=200, help="Drop users if cleaned long_text length < threshold.")
     ap.add_argument("--device", type=str, default="cuda", help="Device for sentence-transformers; requirement says use 'cuda'.")
     ap.add_argument("--model-name", type=str, default="shibing624/text2vec-base-chinese", help="SentenceTransformer model name.")
     ap.add_argument("--encode-batch-size", type=int, default=64, help="sentence-transformers encode batch_size (keywords per batch).")
-    ap.add_argument("--user-batch-size", type=int, default=64, help="How many users per encode flush.")
     ap.add_argument(
         "--require-full-topk",
         action="store_true",
@@ -81,62 +208,142 @@ def main() -> None:
     ap.add_argument("--hf-endpoint", type=str, default="https://hf-mirror.com", help="HF endpoint mirror to speed up downloads.")
     args = ap.parse_args()
 
-    bundle_path = _resolve_path(args.input)
+    max_users: Optional[int] = int(args.max_users) if int(args.max_users) > 0 else None
+    meta = extract_user_features_from_cleaned_jsonl(
+        args.cleaned_input,
+        args.outdir,
+        top_k=int(args.top_k),
+        device=str(args.device),
+        model_name=str(args.model_name),
+        encode_batch_size=int(args.encode_batch_size),
+        require_full_topk=bool(args.require_full_topk),
+        max_users=max_users,
+        hf_endpoint=str(args.hf_endpoint) if args.hf_endpoint else "https://hf-mirror.com",
+    )
+    print("[OK] saved")
+    print(json.dumps(meta, ensure_ascii=False, indent=2))
+    return
+
+    cleaned_input_path = _resolve_path(args.cleaned_input)
     outdir = _resolve_path(args.outdir)
     os.makedirs(outdir, exist_ok=True)
 
-    if not os.path.isfile(bundle_path):
-        raise FileNotFoundError(f"input not found: {bundle_path}")
+    if not os.path.isfile(cleaned_input_path):
+        raise FileNotFoundError(f"cleaned input not found: {cleaned_input_path}")
 
     # Ensure HF downloads use mirror.
+    # Note: some components read the endpoint env var at import / client-init time,
+    # so we force-set (not setdefault) and also provide HUGGINGFACE_HUB_BASE_URL.
     if args.hf_endpoint:
-        os.environ.setdefault("HF_ENDPOINT", args.hf_endpoint)
+        os.environ["HF_ENDPOINT"] = args.hf_endpoint
+        os.environ["HUGGINGFACE_HUB_BASE_URL"] = args.hf_endpoint
 
     _check_cuda(args.device)
 
-    cfg = FeatureExtractionConfig(
-        top_k=int(args.top_k),
-        min_chars=int(args.min_chars),
-        encode_batch_size=int(args.encode_batch_size),
-        device=str(args.device),
-        model_name=str(args.model_name),
-        user_batch_size=int(args.user_batch_size),
-        require_full_topk=bool(args.require_full_topk),
-    )
-
     max_users: Optional[int] = int(args.max_users) if int(args.max_users) > 0 else None
+    top_k = int(args.top_k)
 
-    print(f"[START] bundle={bundle_path}")
-    user_ids, x = extract_user_features(bundle_path, cfg=cfg, max_users=max_users)
+    user_ids: List[str] = []
+    keyword_counts: List[int] = []
+    flat_keywords: List[str] = []
 
-    # Ensure dtype/shape stable.
-    x = x.astype(np.float32, copy=False)
-    if x.ndim != 2:
-        raise RuntimeError(f"unexpected features ndim: {x.shape}")
-    if len(user_ids) != x.shape[0]:
-        raise RuntimeError(f"user_ids len mismatch: {len(user_ids)} vs features rows {x.shape[0]}")
+    print(f"[START] cleaned_input={cleaned_input_path}, top_k={top_k}")
+    with open(cleaned_input_path, "rt", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            uid = str(obj.get("user_id", "")).strip()
+            cleaned_text = str(obj.get("cleaned_text", "") or "").strip()
+            if not uid or not cleaned_text:
+                continue
 
-    features_path = os.path.join(outdir, "user_features_text2vec.npy")
-    ids_path = os.path.join(outdir, "user_ids_text2vec.pkl")
-    meta_path = os.path.join(outdir, "step3_text2vec_meta.json")
+            kws = jieba.analyse.textrank(cleaned_text, topK=top_k, withWeight=False) or []
+            kws = [str(x).strip() for x in kws if str(x).strip()]
+
+            if args.require_full_topk:
+                if len(kws) < top_k:
+                    continue
+                kws = kws[:top_k]
+            else:
+                # 允许少于 top_k：但仍然只取前 top_k，之后对实际数量做 mean pooling
+                kws = kws[:top_k]
+                if len(kws) <= 0:
+                    continue
+
+            user_ids.append(uid)
+            keyword_counts.append(len(kws))
+            flat_keywords.extend(kws)
+
+            if max_users is not None and len(user_ids) >= max_users:
+                break
+
+    if not user_ids:
+        raise RuntimeError("No users found in cleaned_user_texts.jsonl after keyword extraction.")
+
+    n_users = len(user_ids)
+    total_kw = len(flat_keywords)
+    print(f"[STEP A] users={n_users}, total_keywords={total_kw}, require_full_topk={bool(args.require_full_topk)}")
+
+    # Re-create model after env variables are set.
+    # Re-import after env variables are set to ensure HF endpoint takes effect.
+    from sentence_transformers import SentenceTransformer
+
+    model = SentenceTransformer(str(args.model_name), device=str(args.device))
+    print(f"[STEP B] encoding keywords batch_size={int(args.encode_batch_size)}")
+    emb = model.encode(
+        flat_keywords,
+        batch_size=int(args.encode_batch_size),
+        show_progress_bar=True,
+        convert_to_numpy=True,
+        normalize_embeddings=False,
+    ).astype(np.float32, copy=False)
+
+    if emb.ndim != 2:
+        raise RuntimeError(f"unexpected embedding shape: {emb.shape}")
+    dim = int(emb.shape[1])
+    if emb.shape[0] != total_kw:
+        raise RuntimeError(f"embedding count mismatch: got={emb.shape[0]}, expected={total_kw}")
+
+    # mean pooling per user
+    user_features = np.zeros((n_users, dim), dtype=np.float32)
+    start = 0
+    for i, cnt in enumerate(keyword_counts):
+        end = start + cnt
+        user_features[i] = emb[start:end].mean(axis=0)
+        start = end
+
+    x = user_features
+
+    # When doing debug with --max-users, do NOT overwrite the default full-data outputs.
+    if max_users is None:
+        features_path = os.path.join(outdir, "user_features_text2vec.npy")
+        ids_path = os.path.join(outdir, "user_ids_text2vec.pkl")
+        meta_path = os.path.join(outdir, "step3_text2vec_meta.json")
+    else:
+        features_path = os.path.join(outdir, f"user_features_text2vec_max{max_users}.npy")
+        ids_path = os.path.join(outdir, f"user_ids_text2vec_max{max_users}.pkl")
+        meta_path = os.path.join(outdir, f"step3_text2vec_meta_max{max_users}.json")
 
     np.save(features_path, x)
     with open(ids_path, "wb") as f:
         pickle.dump(user_ids, f)
 
     meta = {
-        "input": bundle_path,
+        "cleaned_input": cleaned_input_path,
         "output_features": features_path,
         "output_user_ids": ids_path,
         "n_users": int(x.shape[0]),
         "top_k": int(args.top_k),
-        "min_chars": int(args.min_chars),
         "device": str(args.device),
         "model_name": str(args.model_name),
         "encode_batch_size": int(args.encode_batch_size),
-        "user_batch_size": int(args.user_batch_size),
         "require_full_topk": bool(args.require_full_topk),
         "embed_dim": int(x.shape[1]),
+        "keyword_count_min": int(min(keyword_counts)) if keyword_counts else 0,
+        "keyword_count_max": int(max(keyword_counts)) if keyword_counts else 0,
+        "max_users": max_users,
     }
     with open(meta_path, "wt", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)

@@ -22,6 +22,11 @@ from app_web.hot_search_service import (
     run_hot_search_sample_job as service_run_hot_search_sample_job,
 )
 from app_pipeline.clean_user_text import CleanConfig, clean_bundle_users_to_jsonl
+from app_pipeline.step1_bert_features import extract_user_features_from_cleaned_jsonl
+
+TEXT2VEC_MODEL_NAME = "shibing624/text2vec-base-chinese"
+TEXT2VEC_TOP_K = 10
+TEXT2VEC_ENCODE_BATCH_SIZE = 64
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -713,6 +718,19 @@ def _clean_data_job(job_id: str, input_path: str, min_chars: int):
             progress_cb=_progress_cb,
         )
 
+        _update_job(job_id, status="running", progress=90, progress_label="BERT 向量化中…")
+        # 直接在清洗完成后生成用于聚类/画像的用户向量。
+        bert_meta = extract_user_features_from_cleaned_jsonl(
+            CLEANED_USER_TEXTS_JSONL,
+            OUTPUT_DIR,
+            top_k=TEXT2VEC_TOP_K,
+            device="cuda",
+            model_name=TEXT2VEC_MODEL_NAME,
+            encode_batch_size=TEXT2VEC_ENCODE_BATCH_SIZE,
+            require_full_topk=False,
+            max_users=None,
+        )
+
         _update_job(
             job_id,
             status="completed",
@@ -722,6 +740,7 @@ def _clean_data_job(job_id: str, input_path: str, min_chars: int):
             result={
                 "output_jsonl": CLEANED_USER_TEXTS_JSONL,
                 **result,
+                "bert_features": bert_meta,
             },
         )
     except Exception as exc:

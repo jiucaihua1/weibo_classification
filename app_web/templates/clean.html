@@ -1,10 +1,11 @@
 {% extends "layout.html" %}
 {% block title %}数据清洗 · 微博兴趣看板{% endblock %}
 {% block page_pretitle %}清洗{% endblock %}
-{% block page_title %}数据清洗（输出 cleaned_user_texts.jsonl）{% endblock %}
+{% block page_title %}数据清洗+向量化（输出 cleaned_user_texts.jsonl + BERT 特征）{% endblock %}
 {% block page_sub %}
 <div class="text-secondary mt-1">
   清洗会对每个用户的微博进行过滤与正则清洗：<code>大V(user.verified=True)</code>、<code>非原创(tweet)</code>、<code>转发微博</code> 会被丢弃。清洗结果写入 <code>output/cleaned_user_texts.jsonl</code>。
+  清洗完成后会自动对 <code>cleaned_text</code> 做 TextRank -> text2vec，并生成聚类/画像所需的 <code>user_features_text2vec.npy</code> 与 <code>user_ids_text2vec.pkl</code>。
 </div>
 {% endblock %}
 
@@ -55,6 +56,23 @@
         <div class="text-secondary small mt-3">
           输出文件：<code>{{ workspace.cleaned_user_texts.path }}</code>
           {% if workspace.cleaned_user_texts.exists %}
+            <span class="badge bg-green-lt ms-2">已生成</span>
+          {% else %}
+            <span class="badge bg-secondary-lt ms-2">未生成</span>
+          {% endif %}
+        </div>
+
+        <div class="text-secondary small mt-2">
+          BERT 用户向量：<code>{{ workspace.user_features_text2vec.path }}</code>
+          {% if workspace.user_features_text2vec.exists %}
+            <span class="badge bg-green-lt ms-2">已生成</span>
+          {% else %}
+            <span class="badge bg-secondary-lt ms-2">未生成</span>
+          {% endif %}
+        </div>
+        <div class="text-secondary small mt-1">
+          BERT 用户ID列表：<code>{{ workspace.user_ids_text2vec.path }}</code>
+          {% if workspace.user_ids_text2vec.exists %}
             <span class="badge bg-green-lt ms-2">已生成</span>
           {% else %}
             <span class="badge bg-secondary-lt ms-2">未生成</span>
