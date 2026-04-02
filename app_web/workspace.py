@@ -58,6 +58,8 @@ def get_workspace_state(
     hot_abs = os.path.join(output_dir, "hot_search_user_ids_latest.txt")
     train_rel = rel_posix(project_dir, crawl_json_path)
 
+    cleaned_path = os.path.join(output_dir, "cleaned_user_texts.jsonl")
+
     return {
         "default_user_id": hot_csv if hot_csv else fallback_demo_uid,
         "hot_uid_count": hot_n,
@@ -66,6 +68,7 @@ def get_workspace_state(
         "cookie_char_len": len(cookie_full),
         "default_cookie": cookie_full,
         "crawl_bundle": file_probe(project_dir, crawl_json_path),
+        "cleaned_user_texts": file_probe(project_dir, cleaned_path),
         "profiles_file": file_probe(project_dir, profile_path),
         "train_input_default": train_rel,
     }

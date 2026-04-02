@@ -3,9 +3,12 @@ import json
 import os
 import pickle
 from collections import Counter, defaultdict
-from typing import Dict, List
+from typing import Any, Dict, List, Tuple
 
-from app_pipeline.data_io import load_infer_records
+import numpy as np
+
+from app_pipeline.data_io import iter_crawl_bundle_users
+from app_pipeline.feature_bert_textrank import FeatureExtractionConfig, extract_user_features
 from app_pipeline.preprocess import clean_text
 
 
@@ -38,39 +41,167 @@ def _extract_evidence_rows(records: List[Dict], user_id: str, limit: int = 20) -
     return rows[:limit]
 
 
-def infer(unified_path: str, model_dir: str, output_file: str) -> List[Dict]:
-    with open(os.path.join(model_dir, "tfidf_vectorizer.pkl"), "rb") as f:
-        vectorizer = pickle.load(f)
+def _is_verified_v(raw: Any) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    user = raw.get("user")
+    if isinstance(user, dict):
+        return bool(user.get("verified") is True)
+    return bool(raw.get("verified") is True)
+
+
+def _text_is_retweet(text: str) -> bool:
+    if not text:
+        return False
+    t = str(text).strip()
+    return t == "转发微博" or t.startswith("转发微博")
+
+
+def infer(
+    unified_path: str,
+    model_dir: str,
+    output_file: str,
+) -> List[Dict]:
+    """
+    覆盖替换：用 TextRank + text2vec 用户向量 做 KMeans 聚类并输出兴趣画像。
+    """
     with open(os.path.join(model_dir, "kmeans_model.pkl"), "rb") as f:
-        model = pickle.load(f)
+        km = pickle.load(f)
     with open(os.path.join(model_dir, "cluster_label_map.json"), "rt", encoding="utf-8") as f:
         cluster_map = {int(k): v for k, v in json.load(f).items()}
 
-    records = load_infer_records(unified_path)
-    by_user_text = defaultdict(list)
-    by_user_source = defaultdict(Counter)
-    for row in records:
-        text = clean_text(row.get("text", ""))
-        if text:
-            by_user_text[row["user_id"]].append(text)
-        by_user_source[row["user_id"]][row.get("source_type", "unknown")] += 1
+    # 尝试加载训练阶段缓存的用户特征（推断阶段不重复做 TextRank + BERT）
+    cached_ids_path = os.path.join(model_dir, "user_ids.pkl")
+    cached_feat_path = os.path.join(model_dir, "user_features.npy")
+    cached_src_path = os.path.join(model_dir, "source_bundle_path.txt")
 
-    profiles = []
-    for user_id, texts in by_user_text.items():
-        doc = " ".join(texts)
-        x = vectorizer.transform([doc])
-        cluster_id = int(model.predict(x)[0])
+    input_abs = os.path.abspath(unified_path)
+    use_cache = (
+        os.path.isfile(cached_ids_path)
+        and os.path.isfile(cached_feat_path)
+        and os.path.isfile(cached_src_path)
+    )
+    user_ids: List[str] = []
+    x: np.ndarray
+    if use_cache:
+        try:
+            with open(cached_src_path, "rt", encoding="utf-8") as f:
+                cached_src = f.read().strip()
+            if cached_src == input_abs:
+                import pickle as _pickle
+
+                with open(cached_ids_path, "rb") as f:
+                    user_ids = _pickle.load(f)
+                x = np.load(cached_feat_path).astype(np.float32, copy=False)
+            else:
+                use_cache = False
+        except Exception:
+            use_cache = False
+
+    if not use_cache:
+        # 尝试从 metrics.json 里读取提取参数，保证与训练一致
+        top_k_keywords = 10
+        min_chars = 200
+        device = "cuda"
+        model_name = "shibing624/text2vec-base-chinese"
+        if os.path.isfile(os.path.join(model_dir, "metrics.json")):
+            try:
+                with open(os.path.join(model_dir, "metrics.json"), "rt", encoding="utf-8") as f:
+                    m = json.load(f)
+                top_k_keywords = int(m.get("top_k_keywords", top_k_keywords))
+                min_chars = int(m.get("min_chars", min_chars))
+                device = str(m.get("device", device))
+                model_name = str(m.get("model_name", model_name))
+            except Exception:
+                pass
+
+        cfg = FeatureExtractionConfig(
+            top_k=top_k_keywords,
+            min_chars=min_chars,
+            device=device,
+            model_name=model_name,
+            encode_batch_size=64,
+            user_batch_size=64,
+        )
+        user_ids, x = extract_user_features(unified_path, cfg=cfg)
+
+    if not user_ids:
+        raise RuntimeError("infer: user_ids empty")
+
+    # 预测簇
+    cluster_ids = km.predict(x).astype(int)
+    centroids = km.cluster_centers_.astype(np.float32, copy=False)
+    x_norm = x / (np.linalg.norm(x, axis=1, keepdims=True) + 1e-12)
+    c_norm = centroids / (np.linalg.norm(centroids, axis=1, keepdims=True) + 1e-12)
+    cos_scores = np.sum(x_norm * c_norm[cluster_ids], axis=1)  # (n_users,)
+
+    idx_map = {uid: i for i, uid in enumerate(user_ids)}
+
+    # 证据抽取：流式遍历 bundle users，匹配到已通过过滤的 user_id
+    profiles: List[Dict] = []
+    for user_block in iter_crawl_bundle_users(unified_path):
+        if not isinstance(user_block, dict):
+            continue
+        uid = str(user_block.get("user_id", "")).strip()
+        if not uid or uid not in idx_map:
+            continue
+
+        records = user_block.get("records") or []
+        if not isinstance(records, list) or not records:
+            continue
+
+        # 若用户在特征提取阶段是被过滤掉的，这里可能仍会出现；
+        # 但我们只输出 idx_map 中的用户，且用相同规则过滤证据。
+        texts: List[str] = []
+        source_stats: Counter = Counter()
+        evidence: List[Dict[str, Any]] = []
+        verified = False
+
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            raw = rec.get("raw") or {}
+            if _is_verified_v(raw):
+                verified = True
+                break
+            if rec.get("source_type") != "tweet":
+                continue
+            text = rec.get("text") or ""
+            if _text_is_retweet(text):
+                continue
+            cleaned = clean_text(str(text))
+            if not cleaned:
+                continue
+            texts.append(cleaned)
+            source_stats[rec.get("source_type", "tweet")] += 1
+            evidence.append(
+                {
+                    "created_at": rec.get("created_at"),
+                    "source_type": rec.get("source_type"),
+                    "text": cleaned,
+                    "item_id": rec.get("item_id"),
+                    "url": (raw.get("url") if isinstance(raw, dict) else None),
+                }
+            )
+
+        if verified or not texts:
+            continue
+
+        evidence.sort(key=lambda r: _safe_int(r.get("item_id") or 0, 0), reverse=True)
+        evidence = evidence[:20]
+
+        i = idx_map[uid]
+        cluster_id = int(cluster_ids[i])
         label = cluster_map.get(cluster_id, "其他")
-        center = model.cluster_centers_[cluster_id]
-        score = float(x.multiply(center).sum())
-        evidence = _extract_evidence_rows(records, user_id, limit=20)
+        score = float(cos_scores[i])
+
         profiles.append(
             {
-                "user_id": user_id,
+                "user_id": uid,
                 "top_interest": label,
                 "cluster_id": cluster_id,
                 "interest_scores": {label: score},
-                "source_stats": dict(by_user_source[user_id]),
+                "source_stats": dict(source_stats),
                 "sample_size": len(texts),
                 "evidence": evidence,
             }

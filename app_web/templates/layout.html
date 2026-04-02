@@ -68,6 +68,12 @@
               </a>
             </li>
             <li class="nav-item">
+              <a class="nav-link {% if nav_active == 'clean' %}active{% endif %}" href="/clean">
+                <span class="nav-link-icon d-md-none d-lg-inline-block"><i class="ti ti-sparkles"></i></span>
+                <span class="nav-link-title">数据清洗</span>
+              </a>
+            </li>
+            <li class="nav-item">
               <a class="nav-link {% if nav_active == 'train' %}active{% endif %}" href="/train">
                 <span class="nav-link-icon d-md-none d-lg-inline-block"><i class="ti ti-brain"></i></span>
                 <span class="nav-link-title">训练 / 画像</span>

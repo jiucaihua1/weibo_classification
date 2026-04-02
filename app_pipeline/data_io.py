@@ -1,6 +1,6 @@
 """Load training/infer records from unified jsonl or crawl bundle JSON."""
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterator, List
 
 
 def load_unified_jsonl_records(path: str) -> List[Dict[str, Any]]:
@@ -60,3 +60,26 @@ def load_infer_records(path: str) -> List[Dict[str, Any]]:
                 rows.append(data)
         return rows
     raise ValueError(f"Unsupported input format: {path}")
+
+
+def iter_crawl_bundle_users(path: str) -> Iterator[Dict[str, Any]]:
+    """
+    Stream `users` entries from a crawl bundle JSON without loading the whole file into memory.
+    Requires `ijson` (pip install ijson). Falls back to full json.load if ijson is missing.
+    """
+    try:
+        import ijson  # type: ignore
+    except ImportError:
+        with open(path, "rt", encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+        users = data.get("users") if isinstance(data, dict) else data
+        if not isinstance(users, list):
+            raise ValueError("crawl bundle must contain a 'users' array")
+        for block in users:
+            yield block
+        return
+
+    with open(path, "rb") as f:
+        for item in ijson.items(f, "users.item"):
+            if isinstance(item, dict):
+                yield item

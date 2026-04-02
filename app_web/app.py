@@ -19,6 +19,7 @@ from app_web.hot_search_service import (
     latest_hot_search_debug_file as service_latest_hot_search_debug_file,
     run_hot_search_sample_job as service_run_hot_search_sample_job,
 )
+from app_pipeline.clean_user_text import CleanConfig, clean_bundle_users_to_jsonl
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -31,6 +32,7 @@ PYTHON_BIN = os.path.join(PROJECT_DIR, ".venv", "Scripts", "python.exe")
 OUTPUT_DIR = os.path.join(PROJECT_DIR, "output")
 HOT_SUMMARY_LATEST_PATH = os.path.join(OUTPUT_DIR, "hot_search_keyword_user_summary_latest.json")
 WEIBO_CRAWL_LATEST_JSON = os.path.join(OUTPUT_DIR, "weibo_crawl_latest.json")
+CLEANED_USER_TEXTS_JSONL = os.path.join(OUTPUT_DIR, "cleaned_user_texts.jsonl")
 
 app = FastAPI(title="Weibo Interest Dashboard", version="0.2.0")
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
@@ -356,6 +358,79 @@ def _train_pipeline_job(job_id: str, clusters: int, input_path: str):
         _append_job_log(job_id, f"Failed: {exc}")
 
 
+def _clean_data_job(job_id: str, input_path: str, min_chars: int):
+    try:
+        _update_job(job_id, status="running", progress=2, progress_label="prepare")
+
+        p = (input_path or "").strip()
+        if not p:
+            p = WEIBO_CRAWL_LATEST_JSON
+        if not os.path.isabs(p):
+            p = os.path.normpath(os.path.join(PROJECT_DIR, p))
+        if not os.path.isfile(p):
+            raise RuntimeError(f"clean input not found: {p}")
+
+        def _count_users_in_bundle(bundle_path: str) -> int:
+            try:
+                import ijson  # type: ignore
+
+                c = 0
+                with open(bundle_path, "rb") as f:
+                    for _ in ijson.items(f, "users.item"):
+                        c += 1
+                return c
+            except Exception:
+                with open(bundle_path, "rt", encoding="utf-8", errors="replace") as f:
+                    data = json.load(f)
+                users = data.get("users") if isinstance(data, dict) else data
+                return len(users) if isinstance(users, list) else 0
+
+        expected = _count_users_in_bundle(p)
+        _update_job(job_id, progress=8, progress_label=f"count={expected}")
+
+        def _progress_cb(processed: int, expected_users: int | None):
+            if not expected_users or expected_users <= 0:
+                pct = 10
+            else:
+                pct = int(10 + (processed / expected_users) * 80)
+                pct = max(10, min(95, pct))
+            _update_job(
+                job_id,
+                progress=pct,
+                progress_label=f"cleaning {processed}/{expected_users or '?'}",
+            )
+
+        cfg = CleanConfig(min_chars=int(min_chars))
+        result = clean_bundle_users_to_jsonl(
+            p,
+            CLEANED_USER_TEXTS_JSONL,
+            cfg=cfg,
+            expected_users=expected,
+            progress_cb=_progress_cb,
+        )
+
+        _update_job(
+            job_id,
+            status="completed",
+            progress=100,
+            progress_label="done",
+            completed_at=datetime.now().isoformat(timespec="seconds"),
+            result={
+                "output_jsonl": CLEANED_USER_TEXTS_JSONL,
+                **result,
+            },
+        )
+    except Exception as exc:
+        _update_job(
+            job_id,
+            status="failed",
+            error=str(exc),
+            progress_label="failed",
+            completed_at=datetime.now().isoformat(timespec="seconds"),
+        )
+        _append_job_log(job_id, f"Failed: {exc}")
+
+
 @app.get("/api/profiles")
 def api_profiles():
     return load_profiles()
@@ -424,6 +499,32 @@ def api_cleanup_output(
         del_profiles=bool(int(del_profiles)),
         del_ml_artifacts=bool(int(del_ml_artifacts)),
     )
+
+
+@app.post("/api/clean_data")
+def api_clean_data(
+    input_file: str = Form(""),
+    min_chars: int = Form(200),
+):
+    """
+    对 `weibo_crawl_latest.json` 做数据清洗：
+    输出 `output/cleaned_user_texts.jsonl`，用于后续 TextRank / 向量化 / 建模。
+    """
+    job_id = str(uuid.uuid4())
+    path = (input_file or "").strip()
+    if not path:
+        path = WEIBO_CRAWL_LATEST_JSON
+
+    with jobs_lock:
+        jobs[job_id] = _new_job_record(job_id)
+
+    thread = threading.Thread(
+        target=_clean_data_job,
+        args=(job_id, path, int(min_chars)),
+        daemon=True,
+    )
+    thread.start()
+    return {"job_id": job_id, "status": "queued"}
 
 
 @app.post("/api/hot_search_sample")
@@ -560,6 +661,15 @@ def page_hot_search(request: Request):
         request=request,
         name="hot_search.html",
         context=_page_context(request, "hot_search"),
+    )
+
+
+@app.get("/clean", response_class=HTMLResponse)
+def page_clean(request: Request):
+    return templates.TemplateResponse(
+        request=request,
+        name="clean.html",
+        context=_page_context(request, "clean"),
     )
 
 
