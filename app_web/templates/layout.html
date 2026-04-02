@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}微博兴趣看板{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/@tabler/core@latest/dist/css/tabler.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/tabler-icons.min.css" rel="stylesheet">
+  <style>
+    :root { --app-surface: #f4f6fb; }
+    body {
+      font-family: "Noto Sans SC", system-ui, -apple-system, sans-serif;
+      background: var(--app-surface);
+      color: #1a1d26;
+      min-height: 100vh;
+    }
+    .log-box {
+      background: #0f172a;
+      color: #cbd5e1;
+      border-radius: 0.75rem;
+      font-size: 12px;
+      line-height: 1.55;
+      max-height: 220px;
+      overflow: auto;
+      border: 1px solid rgba(148, 163, 184, .15);
+    }
+    .log-box-wide { max-height: 260px; }
+    .uid-sub { font-size: 0.8rem; color: #64748b; }
+    a.card-hover:hover { box-shadow: 0 4px 20px rgba(30, 42, 74, .12); transform: translateY(-1px); transition: .15s ease; }
+  </style>
+  {% block extra_head %}{% endblock %}
+</head>
+<body>
+  <div class="page">
+    <aside class="navbar navbar-vertical navbar-expand-lg" data-bs-theme="dark">
+      <div class="container-fluid">
+        <h1 class="navbar-brand navbar-brand-autodark">
+          <a href="/" class="text-decoration-none">
+            <i class="ti ti-chart-dots-2 me-2"></i> 微博兴趣看板
+          </a>
+        </h1>
+        <div class="navbar-nav flex-row d-lg-none">
+          <a href="#" class="nav-link" data-bs-toggle="collapse" data-bs-target="#sidebar-menu" aria-label="Open sidebar">
+            <i class="ti ti-menu-2"></i>
+          </a>
+        </div>
+        <div class="collapse navbar-collapse" id="sidebar-menu">
+          <ul class="navbar-nav pt-lg-3">
+            <li class="nav-item">
+              <a class="nav-link {% if nav_active == 'home' %}active{% endif %}" href="/">
+                <span class="nav-link-icon d-md-none d-lg-inline-block"><i class="ti ti-home"></i></span>
+                <span class="nav-link-title">总览</span>
+              </a>
+            </li>
+            <li class="nav-item">
+              <a class="nav-link {% if nav_active == 'hot_search' %}active{% endif %}" href="/hot-search">
+                <span class="nav-link-icon d-md-none d-lg-inline-block"><i class="ti ti-flame"></i></span>
+                <span class="nav-link-title">热搜采样</span>
+              </a>
+            </li>
+            <li class="nav-item">
+              <a class="nav-link {% if nav_active == 'crawl' %}active{% endif %}" href="/crawl">
+                <span class="nav-link-icon d-md-none d-lg-inline-block"><i class="ti ti-download"></i></span>
+                <span class="nav-link-title">抓取微博</span>
+              </a>
+            </li>
+            <li class="nav-item">
+              <a class="nav-link {% if nav_active == 'train' %}active{% endif %}" href="/train">
+                <span class="nav-link-icon d-md-none d-lg-inline-block"><i class="ti ti-brain"></i></span>
+                <span class="nav-link-title">训练 / 画像</span>
+              </a>
+            </li>
+            <li class="nav-item">
+              <a class="nav-link {% if nav_active == 'profiles' %}active{% endif %}" href="/profiles">
+                <span class="nav-link-icon d-md-none d-lg-inline-block"><i class="ti ti-users"></i></span>
+                <span class="nav-link-title">用户画像表</span>
+              </a>
+            </li>
+          </ul>
+        </div>
+      </div>
+    </aside>
+
+    <div class="page-wrapper">
+      <header class="navbar navbar-expand-md d-print-none">
+        <div class="container-xl">
+          <div class="navbar-nav flex-row order-md-last">
+            <div class="nav-item d-none d-md-flex me-3">
+              <div class="btn-list">
+                <a href="https://weibo.com/" target="_blank" rel="noopener" class="btn btn-outline-secondary btn-sm">
+                  <i class="ti ti-brand-weibo me-1"></i> Weibo
+                </a>
+              </div>
+            </div>
+          </div>
+          <div class="navbar-brand navbar-brand-autodark d-none-navbar-horizontal pe-0 pe-md-3">
+            <span class="fw-semibold">爬取 · 聚类 · 画像</span>
+          </div>
+        </div>
+      </header>
+
+      {% block page_header %}
+      <div class="page-header d-print-none">
+        <div class="container-xl">
+          <div class="row g-2 align-items-center">
+            <div class="col">
+              <div class="page-pretitle">{% block page_pretitle %}—{% endblock %}</div>
+              <h2 class="page-title">{% block page_title %}页面{% endblock %}</h2>
+              {% block page_sub %}{% endblock %}
+            </div>
+          </div>
+        </div>
+      </div>
+      {% endblock %}
+
+      <div class="page-body">
+        <div class="container-xl">
+          {% block content %}{% endblock %}
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@tabler/core@latest/dist/js/tabler.min.js"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

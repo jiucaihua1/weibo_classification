@@ -1,0 +1,167 @@
+{% extends "layout.html" %}
+{% block title %}抓取微博 · 微博兴趣看板{% endblock %}
+{% block page_pretitle %}Step 1{% endblock %}
+{% block page_title %}抓取微博{% endblock %}
+{% block page_sub %}
+<div class="text-secondary mt-1">
+  用户 ID 默认来自本地 <code>{{ workspace.hot_uids_file.path }}</code>；Cookie 默认来自 <code>weibospider/cookie.txt</code>。可直接修改后再抓取。
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="row row-cards">
+  <div class="col-12">
+    <div class="card">
+      <div class="card-body">
+        <form id="crawl-form">
+          <div class="row g-3 mb-3">
+            <div class="col-12">
+              <label class="form-label fw-medium">用户 ID</label>
+              <input type="text" name="user_id" class="form-control" value="{{ workspace.default_user_id }}" required placeholder="多个用英文逗号分隔">
+            </div>
+            <div class="col-12">
+              <label class="form-label fw-medium">Cookie</label>
+              <textarea name="cookie" class="form-control font-monospace small" rows="4" placeholder="登录后从浏览器复制 Cookie">{{ workspace.default_cookie }}</textarea>
+            </div>
+          </div>
+          <div class="row g-3 mb-4">
+            <div class="col-6 col-md-3">
+              <label class="form-label small">最大页数</label>
+              <input name="max_pages" type="number" class="form-control" value="1" min="1">
+            </div>
+            <div class="col-4 col-md-2">
+              <label class="form-label small">间隔(s)</label>
+              <input name="download_delay" type="number" class="form-control" value="0.2" step="0.1" min="0">
+            </div>
+            <div class="col-4 col-md-2">
+              <label class="form-label small">并发</label>
+              <input name="concurrent_requests" type="number" class="form-control" value="8" min="1">
+            </div>
+            <div class="col-4 col-md-2">
+              <label class="form-label small">重试</label>
+              <input name="retry_times" type="number" class="form-control" value="2" min="0">
+            </div>
+          </div>
+          <div class="btn-list flex-wrap mb-3">
+            <button type="submit" class="btn btn-primary" id="btn-crawl">
+              <i class="ti ti-download me-1"></i> 抓取微博（生成 JSON）
+            </button>
+            <a href="/train" class="btn btn-outline-secondary">下一步：训练</a>
+          </div>
+        </form>
+        <div class="hr my-4"></div>
+        <div id="job-progress-wrap" class="mb-3 d-none">
+          <div class="d-flex justify-content-between align-items-center mb-1 small text-secondary">
+            <span id="job-progress-label">—</span>
+            <span id="job-progress-pct">0%</span>
+          </div>
+          <div class="progress progress-sm">
+            <div id="job-progress-bar" class="progress-bar bg-primary" role="progressbar" style="width: 0%" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div>
+          </div>
+        </div>
+        <div class="d-flex align-items-center justify-content-between flex-wrap gap-2">
+          <div id="job-status" class="text-secondary small">状态: idle</div>
+          <div class="text-secondary small"><i class="ti ti-terminal-2 me-1"></i>任务日志</div>
+        </div>
+        <pre id="job-logs" class="log-box p-3 mt-2 mb-0"></pre>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  const form = document.getElementById("crawl-form");
+  form.addEventListener("submit", (e) => e.preventDefault());
+  const statusEl = document.getElementById("job-status");
+  const logsEl = document.getElementById("job-logs");
+  let timer = null;
+
+  function stopJobPoll() {
+    if (timer) {
+      clearInterval(timer);
+      timer = null;
+    }
+  }
+
+  function setJobProgress(data) {
+    const wrap = document.getElementById("job-progress-wrap");
+    const bar = document.getElementById("job-progress-bar");
+    const lab = document.getElementById("job-progress-label");
+    const pctEl = document.getElementById("job-progress-pct");
+    if (!wrap || !bar) return;
+    wrap.classList.remove("d-none");
+    const p = Math.max(0, Math.min(100, Number(data.progress) || 0));
+    bar.style.width = p + "%";
+    bar.setAttribute("aria-valuenow", String(p));
+    if (lab) lab.textContent = data.progress_label || "";
+    if (pctEl) pctEl.textContent = p + "%";
+    bar.className = "progress-bar " + (
+      data.status === "failed" ? "bg-danger" : data.status === "completed" ? "bg-success" : "bg-primary"
+    );
+  }
+
+  async function pollJob(jobId) {
+    let data;
+    try {
+      const resp = await fetch(`/api/jobs/${jobId}`);
+      if (resp.status === 404) {
+        stopJobPoll();
+        statusEl.textContent = "状态: 丢失 | 任务不存在（服务端已重启或未找到该 job，请刷新页面后重试）";
+        return;
+      }
+      if (!resp.ok) {
+        stopJobPoll();
+        statusEl.textContent = `状态: 轮询失败 | HTTP ${resp.status}`;
+        return;
+      }
+      data = await resp.json();
+    } catch (e) {
+      stopJobPoll();
+      statusEl.textContent = "状态: 轮询失败 | 网络异常";
+      return;
+    }
+    statusEl.textContent = `状态: ${data.status}${data.error ? " | " + data.error : ""}`;
+    setJobProgress(data);
+    logsEl.textContent = (data.logs || []).join("\n");
+    logsEl.scrollTop = logsEl.scrollHeight;
+    if (data.status === "completed" || data.status === "failed") {
+      stopJobPoll();
+      if (data.status === "completed") setTimeout(() => location.reload(), 800);
+    }
+  }
+
+  document.getElementById("btn-crawl").addEventListener("click", () => {
+    const fd = new FormData();
+    fd.append("user_id", form.querySelector('input[name="user_id"]').value || "");
+    fd.append("cookie", form.querySelector('textarea[name="cookie"]').value || "");
+    fd.append("max_pages", form.querySelector('input[name="max_pages"]').value || "1");
+    fd.append("download_delay", form.querySelector('input[name="download_delay"]').value || "0.2");
+    fd.append("concurrent_requests", form.querySelector('input[name="concurrent_requests"]').value || "8");
+    fd.append("retry_times", form.querySelector('input[name="retry_times"]').value || "2");
+    if (!String(fd.get("user_id") || "").trim()) {
+      statusEl.textContent = "请填写用户ID";
+      return;
+    }
+    if (!String(fd.get("cookie") || "").trim()) {
+      statusEl.textContent = "请填写 Cookie";
+      return;
+    }
+    statusEl.textContent = "状态: submitting...";
+    logsEl.textContent = "";
+    setJobProgress({ status: "queued", progress: 0, progress_label: "提交任务…" });
+    fetch("/api/crawl_weibo", { method: "POST", body: fd }).then(async (resp) => {
+      const data = await resp.json();
+      if (!resp.ok) {
+        statusEl.textContent = `状态: failed | ${data.error || "submit failed"}`;
+        return;
+      }
+      statusEl.textContent = `状态: queued | job=${data.job_id}`;
+      stopJobPoll();
+      timer = setInterval(() => pollJob(data.job_id), 1500);
+      pollJob(data.job_id);
+    });
+  });
+</script>
+{% endblock %}

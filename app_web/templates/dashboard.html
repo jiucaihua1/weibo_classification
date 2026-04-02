@@ -1,0 +1,253 @@
+{% extends "layout.html" %}
+{% block title %}总览 · 微博兴趣看板{% endblock %}
+{% block page_pretitle %}本地优先{% endblock %}
+{% block page_title %}Dashboard{% endblock %}
+{% block page_sub %}
+<div class="text-secondary mt-1">
+  重启后会自动读取 <code>output/</code> 与 <code>weibospider/cookie.txt</code>：热搜 UID、已抓取 JSON、Cookie。流程在左侧分步进入各页面。
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="row row-deck row-cards mb-3">
+  <div class="col-sm-6 col-lg-3">
+    <div class="card">
+      <div class="card-body">
+        <div class="subheader">用户画像数</div>
+        <div class="h1 mb-0">{{ workspace.profiles_count }}</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-lg-3">
+    <div class="card">
+      <div class="card-body">
+        <div class="subheader">类别数（Top1）</div>
+        <div class="h1 mb-0">{{ interest_distribution|length }}</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-lg-3">
+    <div class="card">
+      <div class="card-body">
+        <div class="subheader">热搜 UID 文件</div>
+        <div class="h1 mb-0">{{ workspace.hot_uid_count }}</div>
+        <div class="text-secondary small">个（<code>{{ workspace.hot_uids_file.path }}</code>）</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-lg-3">
+    <div class="card">
+      <div class="card-body d-flex flex-column">
+        <div class="subheader">本地 output</div>
+        <div class="h1 mb-0">{% if workspace.crawl_bundle.exists %}已抓取{% else %}待抓取{% endif %}</div>
+        <div class="text-secondary small">训练默认读 <code>{{ workspace.train_input_default }}</code></div>
+        <div class="text-secondary small mt-2">清理见下方「按步骤删除」。</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row row-cards mb-4" id="cleanup-panel">
+  <div class="col-12">
+    <div class="card">
+      <div class="card-header"><h3 class="card-title mb-0">清理 output（按步骤勾选）</h3></div>
+      <div class="card-body">
+        <div class="row g-3">
+          <div class="col-md-6">
+            <label class="form-check">
+              <input type="checkbox" class="form-check-input" id="cl-hot">
+              <span class="form-check-label">① 热搜采样：<code>hot_search_user_ids_latest.txt</code>、<code>hot_search_debug_*.json</code>、<code>hot_search_keyword_user_summary_*.json</code></span>
+            </label>
+          </div>
+          <div class="col-md-6">
+            <label class="form-check">
+              <input type="checkbox" class="form-check-input" id="cl-mid">
+              <span class="form-check-label">② 抓取中间件：<code>unified_*.jsonl</code>、<code>user_aggregate_*.json</code></span>
+            </label>
+          </div>
+          <div class="col-md-6">
+            <label class="form-check">
+              <input type="checkbox" class="form-check-input" id="cl-bundle">
+              <span class="form-check-label">③ 抓取结果：<code>weibo_crawl_latest.json</code> 及所有 <code>weibo_crawl_*.json</code></span>
+            </label>
+          </div>
+          <div class="col-md-6">
+            <label class="form-check">
+              <input type="checkbox" class="form-check-input" id="cl-uinfo">
+              <span class="form-check-label">④ 用户资料缓存：<code>user_infos.json</code></span>
+            </label>
+          </div>
+          <div class="col-md-6">
+            <label class="form-check">
+              <input type="checkbox" class="form-check-input" id="cl-prof">
+              <span class="form-check-label">⑤ 画像结果：<code>user_interest_profiles.json</code></span>
+            </label>
+          </div>
+          <div class="col-md-6">
+            <label class="form-check">
+              <input type="checkbox" class="form-check-input" id="cl-ml">
+              <span class="form-check-label text-danger">⑥ 模型目录：<code>output/ml_artifacts</code>（需重新训练）</span>
+            </label>
+          </div>
+        </div>
+        <div class="btn-list flex-wrap mt-3">
+          <button type="button" id="cleanup-selective" class="btn btn-danger">
+            <i class="ti ti-trash me-1"></i> 删除已勾选
+          </button>
+          <button type="button" id="cleanup-full" class="btn btn-outline-danger">
+            一键清空整个 output（仍保留 <code>ml_artifacts</code>）
+          </button>
+        </div>
+        <div id="cleanup-result" class="text-secondary small mt-2 mb-0"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row row-cards mb-4">
+  <div class="col-12">
+    <div class="card">
+      <div class="card-header"><h3 class="card-title mb-0">本地数据状态</h3></div>
+      <div class="card-body p-0">
+        <div class="table-responsive">
+          <table class="table table-vcenter mb-0">
+            <thead>
+              <tr>
+                <th>文件</th>
+                <th>状态</th>
+                <th>大小</th>
+                <th>修改时间</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="font-monospace small">{{ workspace.hot_uids_file.path }}</td>
+                <td>{% if workspace.hot_uids_file.exists %}<span class="badge bg-green-lt">存在</span>{% else %}<span class="badge bg-secondary-lt">无</span>{% endif %}</td>
+                <td class="small">{% if workspace.hot_uids_file.exists %}{{ workspace.hot_uids_file.size_bytes }} B{% else %}—{% endif %}</td>
+                <td class="small text-secondary">{{ workspace.hot_uids_file.mtime_iso or "—" }}</td>
+              </tr>
+              <tr>
+                <td class="font-monospace small">{{ workspace.crawl_bundle.path }}</td>
+                <td>{% if workspace.crawl_bundle.exists %}<span class="badge bg-green-lt">存在</span>{% else %}<span class="badge bg-orange-lt">需先抓取</span>{% endif %}</td>
+                <td class="small">{% if workspace.crawl_bundle.exists %}{{ workspace.crawl_bundle.size_bytes }} B{% else %}—{% endif %}</td>
+                <td class="small text-secondary">{{ workspace.crawl_bundle.mtime_iso or "—" }}</td>
+              </tr>
+              <tr>
+                <td class="font-monospace small">{{ workspace.profiles_file.path }}</td>
+                <td>{% if workspace.profiles_file.exists %}<span class="badge bg-green-lt">存在</span>{% else %}<span class="badge bg-secondary-lt">无</span>{% endif %}</td>
+                <td class="small">{% if workspace.profiles_file.exists %}{{ workspace.profiles_file.size_bytes }} B{% else %}—{% endif %}</td>
+                <td class="small text-secondary">{{ workspace.profiles_file.mtime_iso or "—" }}</td>
+              </tr>
+              <tr>
+                <td class="font-monospace small">weibospider/cookie.txt</td>
+                <td>{% if workspace.cookie_saved %}<span class="badge bg-green-lt">已保存</span>{% else %}<span class="badge bg-orange-lt">未填写</span>{% endif %}</td>
+                <td class="small">{% if workspace.cookie_saved %}{{ workspace.cookie_char_len }} 字符{% else %}—{% endif %}</td>
+                <td class="small text-secondary">—</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card-body border-top text-secondary small">
+        抓取页默认用户 ID 来自 <code>{{ workspace.hot_uids_file.path }}</code>（每行一个 UID，页面里用逗号展示）。训练页默认输入为当前目录下的抓取 JSON。
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row g-3 mb-4">
+  <div class="col-md-6 col-lg-4">
+    <a href="/hot-search" class="text-decoration-none text-reset">
+      <div class="card card-hover h-100">
+        <div class="card-body">
+          <div class="d-flex align-items-center gap-2 mb-2"><i class="ti ti-flame text-primary"></i><span class="fw-semibold">热搜采样</span></div>
+          <div class="text-secondary small">从热搜评论者抽取 UID，写入本地列表。</div>
+        </div>
+      </div>
+    </a>
+  </div>
+  <div class="col-md-6 col-lg-4">
+    <a href="/crawl" class="text-decoration-none text-reset">
+      <div class="card card-hover h-100">
+        <div class="card-body">
+          <div class="d-flex align-items-center gap-2 mb-2"><i class="ti ti-download text-primary"></i><span class="fw-semibold">抓取微博</span></div>
+          <div class="text-secondary small">按 UID 生成 <code>weibo_crawl_latest.json</code>。</div>
+        </div>
+      </div>
+    </a>
+  </div>
+  <div class="col-md-6 col-lg-4">
+    <a href="/train" class="text-decoration-none text-reset">
+      <div class="card card-hover h-100">
+        <div class="card-body">
+          <div class="d-flex align-items-center gap-2 mb-2"><i class="ti ti-brain text-primary"></i><span class="fw-semibold">训练 / 画像</span></div>
+          <div class="text-secondary small">读取本地 JSON 聚类并写回画像文件。</div>
+        </div>
+      </div>
+    </a>
+  </div>
+</div>
+
+<div class="row row-cards mb-4">
+  <div class="col-12">
+    <div class="card">
+      <div class="card-header d-flex flex-wrap align-items-center gap-2">
+        <h3 class="card-title mb-0">类别占比</h3>
+        <a href="/profiles" class="btn btn-sm btn-outline-primary ms-auto">打开画像表</a>
+      </div>
+      <div class="card-body">
+        {% if interest_distribution %}
+          <div class="d-flex flex-wrap gap-2">
+            {% for k, v in interest_distribution.items() %}
+              <span class="badge bg-secondary-lt">{{ k }} <span class="ms-1 fw-semibold">{{ v }}</span></span>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div class="text-secondary">暂无训练结果。</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  async function postCleanup(fd) {
+    const el = document.getElementById("cleanup-result");
+    el.textContent = "正在执行…";
+    const resp = await fetch("/api/cleanup_output", { method: "POST", body: fd });
+    const data = await resp.json();
+    if (!resp.ok) {
+      el.textContent = "失败：" + (data.error || "unknown");
+      return;
+    }
+    let msg = `完成：文件 ${data.removed_files}，目录 ${data.removed_dirs}`;
+    if (data.breakdown && Object.keys(data.breakdown).length)
+      msg += " | " + JSON.stringify(data.breakdown);
+    el.textContent = msg;
+    setTimeout(() => location.reload(), 600);
+  }
+
+  document.getElementById("cleanup-selective").addEventListener("click", async () => {
+    const fd = new FormData();
+    fd.append("mode", "selective");
+    fd.append("del_hot_search", document.getElementById("cl-hot").checked ? "1" : "0");
+    fd.append("del_crawl_intermediate", document.getElementById("cl-mid").checked ? "1" : "0");
+    fd.append("del_crawl_bundle", document.getElementById("cl-bundle").checked ? "1" : "0");
+    fd.append("del_user_infos", document.getElementById("cl-uinfo").checked ? "1" : "0");
+    fd.append("del_profiles", document.getElementById("cl-prof").checked ? "1" : "0");
+    fd.append("del_ml_artifacts", document.getElementById("cl-ml").checked ? "1" : "0");
+    if (!confirm("确定删除已勾选的文件？此操作不可恢复。")) return;
+    await postCleanup(fd);
+  });
+
+  document.getElementById("cleanup-full").addEventListener("click", async () => {
+    if (!confirm("将删除 output 下几乎全部文件，仅保留 ml_artifacts 目录。确定？")) return;
+    const fd = new FormData();
+    fd.append("mode", "full");
+    fd.append("keep_ml_artifacts", "1");
+    await postCleanup(fd);
+  });
+</script>
+{% endblock %}

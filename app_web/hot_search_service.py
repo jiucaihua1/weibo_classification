@@ -310,13 +310,16 @@ def run_hot_search_sample_job(
     update_job,
 ):
     try:
-        update_job(job_id, status="running")
+        update_job(job_id, status="running", progress=1, progress_label="更新 Cookie 并拉取热搜…")
         with open(cookie_path, "wt", encoding="utf-8") as f:
             f.write(cookie.strip())
         append_job_log(job_id, "Cookie updated.")
         hotwords = _fetch_hot_search_keywords(cookie, limit=int(hotword_limit))
         if not hotwords:
             raise RuntimeError("hot search returned empty")
+
+        n_kw = len(hotwords)
+        update_job(job_id, progress=4, progress_label=f"已获取 {n_kw} 个热搜词，开始逐词采样…")
 
         before_job_unified = _list_unified_files(output_dir)
         before_job_aggregate = _list_user_aggregate_files(output_dir)
@@ -334,7 +337,11 @@ def run_hot_search_sample_job(
 
         all_uids, seen, stats = [], set(), []
         debug_items = []
+        span = 82.0 / max(n_kw, 1)
         for idx, kw in enumerate(hotwords, start=1):
+            pct = int(min(88, 6 + (idx - 1) * span))
+            short_kw = (kw[:28] + "…") if len(kw) > 28 else kw
+            update_job(job_id, progress=pct, progress_label=f"热搜 [{idx}/{n_kw}] {short_kw}")
             env = dict(env_base)
             env["WEIBO_KEYWORDS"] = kw
             before = _list_unified_files(output_dir)
@@ -417,6 +424,7 @@ def run_hot_search_sample_job(
         if total_uid_limit:
             all_uids = all_uids[: int(total_uid_limit)]
         random.shuffle(all_uids)
+        update_job(job_id, progress=92, progress_label="写入 UID 列表与调试/汇总文件…")
         os.makedirs(output_dir, exist_ok=True)
         output_file = os.path.join(output_dir, "hot_search_user_ids_latest.txt")
         with open(output_file, "wt", encoding="utf-8") as f:
@@ -472,6 +480,8 @@ def run_hot_search_sample_job(
         update_job(
             job_id,
             status="completed",
+            progress=100,
+            progress_label="完成",
             completed_at=datetime.now().isoformat(timespec="seconds"),
             result={
                 "user_ids": all_uids,
@@ -485,5 +495,11 @@ def run_hot_search_sample_job(
             },
         )
     except Exception as exc:
-        update_job(job_id, status="failed", error=str(exc), completed_at=datetime.now().isoformat(timespec="seconds"))
+        update_job(
+            job_id,
+            status="failed",
+            error=str(exc),
+            progress_label="失败",
+            completed_at=datetime.now().isoformat(timespec="seconds"),
+        )
         append_job_log(job_id, f"Failed: {exc}")

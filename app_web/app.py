@@ -11,9 +11,10 @@ from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
-from app_web.crawl_bundle import build_crawl_bundle, write_crawl_bundle
+from app_web.crawl_bundle import build_crawl_bundle, cleanup_post_crawl_artifacts, write_crawl_bundle
+from app_web.output_cleanup import cleanup_output_full, cleanup_output_selective
+from app_web.workspace import get_workspace_state
 from app_web.hot_search_service import (
-    cleanup_paired_unified_and_aggregate,
     get_hot_search_speed_profile as service_get_hot_search_speed_profile,
     latest_hot_search_debug_file as service_latest_hot_search_debug_file,
     run_hot_search_sample_job as service_run_hot_search_sample_job,
@@ -35,6 +36,14 @@ app = FastAPI(title="Weibo Interest Dashboard", version="0.2.0")
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 jobs = {}
 jobs_lock = threading.Lock()
+
+
+def _page_context(request: Request, nav_active: str, **extra):
+    ws = get_workspace_state(PROJECT_DIR, OUTPUT_DIR, COOKIE_PATH, PROFILE_PATH, WEIBO_CRAWL_LATEST_JSON)
+    ws["profiles_count"] = len(load_profiles())
+    ctx = {"request": request, "nav_active": nav_active, "workspace": ws}
+    ctx.update(extra)
+    return ctx
 
 
 def latest_unified_file() -> str:
@@ -59,7 +68,12 @@ def load_user_infos() -> dict:
 def _list_unified_files() -> set[str]:
     if not os.path.exists(OUTPUT_DIR):
         return set()
-    return {os.path.join(OUTPUT_DIR, n) for n in os.listdir(OUTPUT_DIR) if n.startswith("unified_") and n.endswith(".jsonl")}
+    out: set[str] = set()
+    for n in os.listdir(OUTPUT_DIR):
+        if n.startswith("unified_") and n.endswith(".jsonl"):
+            p = os.path.join(OUTPUT_DIR, n)
+            out.add(os.path.normcase(os.path.normpath(os.path.abspath(p))))
+    return out
 
 
 def _pick_new_unified(before: set[str], after: set[str]) -> str:
@@ -108,36 +122,20 @@ def _ordered_unique_user_ids(user_ids_raw: str) -> list[str]:
     return out
 
 
-def _cleanup_output(keep_ml_artifacts: bool = True) -> dict:
-    removed_files, removed_dirs = 0, 0
-    if not os.path.exists(OUTPUT_DIR):
-        return {"removed_files": 0, "removed_dirs": 0}
-    for name in os.listdir(OUTPUT_DIR):
-        path = os.path.join(OUTPUT_DIR, name)
-        if keep_ml_artifacts and name == "ml_artifacts" and os.path.isdir(path):
-            continue
-        if os.path.isdir(path):
-            for root, dirs, files in os.walk(path, topdown=False):
-                for fn in files:
-                    try:
-                        os.remove(os.path.join(root, fn)); removed_files += 1
-                    except OSError:
-                        pass
-                for dn in dirs:
-                    try:
-                        os.rmdir(os.path.join(root, dn)); removed_dirs += 1
-                    except OSError:
-                        pass
-            try:
-                os.rmdir(path); removed_dirs += 1
-            except OSError:
-                pass
-        else:
-            try:
-                os.remove(path); removed_files += 1
-            except OSError:
-                pass
-    return {"removed_files": removed_files, "removed_dirs": removed_dirs}
+def _new_job_record(job_id: str, *, user_id: str = "") -> dict:
+    ts = datetime.now().isoformat(timespec="seconds")
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "error": "",
+        "created_at": ts,
+        "completed_at": "",
+        "user_id": user_id,
+        "logs": [],
+        "result": {},
+        "progress": 0,
+        "progress_label": "排队中…",
+    }
 
 
 def _append_job_log(job_id: str, message: str):
@@ -163,7 +161,29 @@ def _latest_hot_search_debug_file() -> str:
 
 def _run_cmd(job_id: str, cmd: list[str], cwd: str, env: dict):
     _append_job_log(job_id, f"[RUN] {' '.join(cmd)}")
-    completed = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    raw_timeout = (env or {}).get("WEB_CMD_TIMEOUT_SEC") or os.environ.get("WEB_CMD_TIMEOUT_SEC")
+    timeout_sec = None
+    if raw_timeout not in (None, ""):
+        try:
+            timeout_sec = float(raw_timeout)
+            if timeout_sec <= 0:
+                timeout_sec = None
+        except (TypeError, ValueError):
+            timeout_sec = None
+    try:
+        completed = subprocess.run(
+            cmd,
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired:
+        _append_job_log(job_id, f"子进程超时（WEB_CMD_TIMEOUT_SEC={timeout_sec}），已终止")
+        raise RuntimeError(f"命令超时（>{timeout_sec}s）: {' '.join(cmd)}") from None
     if completed.stdout:
         for line in completed.stdout.splitlines()[-20:]:
             _append_job_log(job_id, line)
@@ -211,7 +231,7 @@ def _hot_search_sample_job(job_id: str, cookie: str, hotword_limit: int, keyword
 def _crawl_weibo_job(job_id: str, user_id: str, cookie: str, max_pages: int,
                      download_delay: float, concurrent_requests: int, retry_times: int):
     try:
-        _update_job(job_id, status="running")
+        _update_job(job_id, status="running", progress=5, progress_label="准备环境…")
         with open(COOKIE_PATH, "wt", encoding="utf-8") as f:
             f.write(cookie.strip())
 
@@ -224,6 +244,7 @@ def _crawl_weibo_job(job_id: str, user_id: str, cookie: str, max_pages: int,
         env["WEIBO_RETRY_TIMES"] = str(retry_times)
 
         before_pipeline = _list_unified_files()
+        _update_job(job_id, progress=15, progress_label="① 抓取用户资料（user）…")
         _run_cmd(job_id, [PYTHON_BIN, "run_spider.py", "user"], WEIBO_DIR, env)
         after_user = _list_unified_files()
         user_unified = _pick_new_unified(before_pipeline, after_user)
@@ -237,6 +258,7 @@ def _crawl_weibo_job(job_id: str, user_id: str, cookie: str, max_pages: int,
                 with open(USER_INFO_PATH, "wt", encoding="utf-8") as f:
                     json.dump(infos, f, ensure_ascii=False, indent=2)
 
+        _update_job(job_id, progress=45, progress_label="② 抓取用户微博（tweet_by_user_id）…")
         _run_cmd(job_id, [PYTHON_BIN, "run_spider.py", "tweet_by_user_id"], WEIBO_DIR, env)
         unified = latest_unified_file()
         if not unified:
@@ -244,28 +266,43 @@ def _crawl_weibo_job(job_id: str, user_id: str, cookie: str, max_pages: int,
         after_pipeline = _list_unified_files()
         generated_unified = list(after_pipeline - before_pipeline)
         ordered_ids = _ordered_unique_user_ids(user_id)
+        _update_job(job_id, progress=78, progress_label="③ 合并为 weibo_crawl_latest.json …")
         payload = build_crawl_bundle(job_id=job_id, user_ids_ordered=ordered_ids, unified_paths=generated_unified)
-        latest_path, archived_path = write_crawl_bundle(OUTPUT_DIR, job_id, payload)
+        latest_path, _archive_placeholder = write_crawl_bundle(OUTPUT_DIR, job_id, payload)
         n_with_data = sum(1 for u in payload["users"] if u.get("records"))
-        _append_job_log(job_id, f"Crawl bundle saved: {latest_path} (archive: {archived_path})")
+        _append_job_log(job_id, f"Crawl bundle saved: {latest_path}")
         _append_job_log(job_id, f"Users with at least one record: {n_with_data} / {len(ordered_ids)}")
-        ru, ra = cleanup_paired_unified_and_aggregate(generated_unified)
-        _append_job_log(job_id, f"Removed crawl artifacts: unified={ru}, user_aggregate={ra}")
+        _update_job(job_id, progress=92, progress_label="④ 清理中间文件…")
+        swept = cleanup_post_crawl_artifacts(OUTPUT_DIR)
+        _append_job_log(
+            job_id,
+            f"Swept intermediates: unified={swept['unified']} user_aggregate={swept['user_aggregate']} "
+            f"extra_weibo_crawl_json={swept['weibo_crawl_extra']}",
+        )
         _update_job(
             job_id,
             status="completed",
+            progress=100,
+            progress_label="完成",
             completed_at=datetime.now().isoformat(timespec="seconds"),
             result={
                 "output_file": latest_path,
-                "archive_file": archived_path,
+                "archive_file": "",
                 "n_users_requested": len(ordered_ids),
                 "n_users_with_records": n_with_data,
-                "removed_intermediate_unified": ru,
-                "removed_intermediate_user_aggregate": ra,
+                "swept_unified": swept["unified"],
+                "swept_user_aggregate": swept["user_aggregate"],
+                "swept_extra_weibo_json": swept["weibo_crawl_extra"],
             },
         )
     except Exception as exc:
-        _update_job(job_id, status="failed", error=str(exc), completed_at=datetime.now().isoformat(timespec="seconds"))
+        _update_job(
+            job_id,
+            status="failed",
+            error=str(exc),
+            progress_label="失败",
+            completed_at=datetime.now().isoformat(timespec="seconds"),
+        )
         _append_job_log(job_id, f"Failed: {exc}")
 
 
@@ -280,17 +317,19 @@ def _resolve_training_input(path: str) -> str:
 
 def _train_pipeline_job(job_id: str, clusters: int, input_path: str):
     try:
-        _update_job(job_id, status="running")
+        _update_job(job_id, status="running", progress=8, progress_label="检查训练输入…")
         path = _resolve_training_input(input_path)
         if not os.path.isfile(path):
             raise RuntimeError(f"训练输入文件不存在: {path}，请先执行「抓取微博」。")
         env = os.environ.copy()
+        _update_job(job_id, progress=25, progress_label="① 聚类训练（train）…")
         _run_cmd(
             job_id,
             [PYTHON_BIN, "-m", "app_pipeline.train", "--input", path, "--output-dir", os.path.join("output", "ml_artifacts"), "--clusters", str(clusters)],
             PROJECT_DIR,
             env,
         )
+        _update_job(job_id, progress=55, progress_label="② 推断画像（infer）…")
         _run_cmd(
             job_id,
             [PYTHON_BIN, "-m", "app_pipeline.infer", "--input", path, "--model-dir", os.path.join("output", "ml_artifacts"), "--output", os.path.join("output", "user_interest_profiles.json")],
@@ -301,11 +340,19 @@ def _train_pipeline_job(job_id: str, clusters: int, input_path: str):
         _update_job(
             job_id,
             status="completed",
+            progress=100,
+            progress_label="完成",
             completed_at=datetime.now().isoformat(timespec="seconds"),
             result={"input_file": path, "profiles": os.path.join("output", "user_interest_profiles.json")},
         )
     except Exception as exc:
-        _update_job(job_id, status="failed", error=str(exc), completed_at=datetime.now().isoformat(timespec="seconds"))
+        _update_job(
+            job_id,
+            status="failed",
+            error=str(exc),
+            progress_label="失败",
+            completed_at=datetime.now().isoformat(timespec="seconds"),
+        )
         _append_job_log(job_id, f"Failed: {exc}")
 
 
@@ -329,6 +376,13 @@ def api_stats():
     return {"total_users": len(profiles), "interest_distribution": dict(counter)}
 
 
+@app.get("/api/workspace")
+def api_workspace():
+    ws = get_workspace_state(PROJECT_DIR, OUTPUT_DIR, COOKIE_PATH, PROFILE_PATH, WEIBO_CRAWL_LATEST_JSON)
+    ws["profiles_count"] = len(load_profiles())
+    return {k: v for k, v in ws.items() if k != "default_cookie"}
+
+
 @app.get("/api/jobs/{job_id}")
 def api_job(job_id: str):
     with jobs_lock:
@@ -339,9 +393,37 @@ def api_job(job_id: str):
 
 
 @app.post("/api/cleanup_output")
-def api_cleanup_output(keep_ml_artifacts: int = Form(1)):
-    summary = _cleanup_output(keep_ml_artifacts=bool(int(keep_ml_artifacts)))
-    return {"status": "ok", **summary}
+def api_cleanup_output(
+    mode: str = Form("selective"),
+    keep_ml_artifacts: int = Form(1),
+    del_hot_search: int = Form(0),
+    del_crawl_intermediate: int = Form(0),
+    del_crawl_bundle: int = Form(0),
+    del_user_infos: int = Form(0),
+    del_profiles: int = Form(0),
+    del_ml_artifacts: int = Form(0),
+):
+    if mode == "full":
+        return cleanup_output_full(OUTPUT_DIR, keep_ml_artifacts=bool(int(keep_ml_artifacts)))
+    flags = [
+        int(del_hot_search),
+        int(del_crawl_intermediate),
+        int(del_crawl_bundle),
+        int(del_user_infos),
+        int(del_profiles),
+        int(del_ml_artifacts),
+    ]
+    if not any(flags):
+        return JSONResponse(status_code=400, content={"error": "请至少勾选一类要删除的内容，或改用手动「清空 output」。"})
+    return cleanup_output_selective(
+        OUTPUT_DIR,
+        del_hot_search=bool(int(del_hot_search)),
+        del_crawl_intermediate=bool(int(del_crawl_intermediate)),
+        del_crawl_bundle=bool(int(del_crawl_bundle)),
+        del_user_infos=bool(int(del_user_infos)),
+        del_profiles=bool(int(del_profiles)),
+        del_ml_artifacts=bool(int(del_ml_artifacts)),
+    )
 
 
 @app.post("/api/hot_search_sample")
@@ -356,8 +438,7 @@ def api_hot_search_sample(
         return JSONResponse(status_code=400, content={"error": "cookie is required"})
     job_id = str(uuid.uuid4())
     with jobs_lock:
-        jobs[job_id] = {"job_id": job_id, "status": "queued", "error": "", "created_at": datetime.now().isoformat(timespec="seconds"),
-                        "completed_at": "", "user_id": "", "logs": [], "result": {}}
+        jobs[job_id] = _new_job_record(job_id)
     profile = _get_hot_search_speed_profile(speed_mode)
     thread = threading.Thread(
         target=_hot_search_sample_job,
@@ -416,8 +497,7 @@ def api_crawl_weibo(
         return JSONResponse(status_code=400, content={"error": "user_id is required"})
     job_id = str(uuid.uuid4())
     with jobs_lock:
-        jobs[job_id] = {"job_id": job_id, "status": "queued", "error": "", "created_at": datetime.now().isoformat(timespec="seconds"),
-                        "completed_at": "", "user_id": user_id, "logs": [], "result": {}}
+        jobs[job_id] = _new_job_record(job_id, user_id=user_id)
     thread = threading.Thread(
         target=_crawl_weibo_job,
         args=(job_id, user_id, cookie, max_pages, download_delay, concurrent_requests, retry_times),
@@ -435,8 +515,7 @@ def api_train(
     job_id = str(uuid.uuid4())
     path = (input_file or "").strip() or WEIBO_CRAWL_LATEST_JSON
     with jobs_lock:
-        jobs[job_id] = {"job_id": job_id, "status": "queued", "error": "", "created_at": datetime.now().isoformat(timespec="seconds"),
-                        "completed_at": "", "user_id": "", "logs": [], "result": {}}
+        jobs[job_id] = _new_job_record(job_id)
     thread = threading.Thread(
         target=_train_pipeline_job,
         args=(job_id, clusters, path),
@@ -449,13 +528,49 @@ def api_train(
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request):
     profiles = load_profiles()
-    user_infos = load_user_infos()
     top_counter = Counter([x.get("top_interest", "其他") for x in profiles])
     return templates.TemplateResponse(
         request=request,
-        name="index.html",
-        context={"request": request, "profiles": profiles, "user_infos": user_infos,
-                 "interest_distribution": dict(top_counter), "default_user_id": "1087770692"},
+        name="dashboard.html",
+        context=_page_context(request, "home", interest_distribution=dict(top_counter)),
+    )
+
+
+@app.get("/crawl", response_class=HTMLResponse)
+def page_crawl(request: Request):
+    return templates.TemplateResponse(
+        request=request,
+        name="crawl.html",
+        context=_page_context(request, "crawl"),
+    )
+
+
+@app.get("/train", response_class=HTMLResponse)
+def page_train(request: Request):
+    return templates.TemplateResponse(
+        request=request,
+        name="train.html",
+        context=_page_context(request, "train"),
+    )
+
+
+@app.get("/hot-search", response_class=HTMLResponse)
+def page_hot_search(request: Request):
+    return templates.TemplateResponse(
+        request=request,
+        name="hot_search.html",
+        context=_page_context(request, "hot_search"),
+    )
+
+
+@app.get("/profiles", response_class=HTMLResponse)
+def page_profiles(request: Request):
+    profiles = load_profiles()
+    user_infos = load_user_infos()
+    return templates.TemplateResponse(
+        request=request,
+        name="profiles.html",
+        context=_page_context(request, "profiles", profiles=profiles, user_infos=user_infos),
     )
 
 
@@ -469,4 +584,8 @@ def user_detail(request: Request, user_id: str):
     if not target:
         raise HTTPException(status_code=404, detail="user not found")
     user_info = load_user_infos().get(str(user_id), {})
-    return templates.TemplateResponse(request=request, name="detail.html", context={"request": request, "profile": target, "user_info": user_info})
+    return templates.TemplateResponse(
+        request=request,
+        name="detail.html",
+        context=_page_context(request, "profiles", profile=target, user_info=user_info),
+    )

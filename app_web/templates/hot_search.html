@@ -1,0 +1,185 @@
+{% extends "layout.html" %}
+{% block title %}热搜采样 · 微博兴趣看板{% endblock %}
+{% block page_pretitle %}UID 来源{% endblock %}
+{% block page_title %}热搜采样{% endblock %}
+{% block page_sub %}
+<div class="text-secondary mt-1">
+  仅从评论者抽样 UID，写入 <code>{{ workspace.hot_uids_file.path }}</code>。<a href="/crawl">抓取页</a>启动时会自动载入该列表。Cookie 默认读取本地文件，亦可粘贴覆盖。
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="row row-cards mb-4">
+  <div class="col-12">
+    <div class="card">
+      <div class="card-body">
+        <div class="row g-3 mb-3">
+          <div class="col-12">
+            <label class="form-label fw-medium">Cookie</label>
+            <textarea id="hs-cookie" class="form-control font-monospace small" rows="4" placeholder="从浏览器复制登录后的 Cookie">{{ workspace.default_cookie }}</textarea>
+          </div>
+        </div>
+        <div class="row g-2 align-items-end flex-wrap mb-3">
+          <div class="col-6 col-md-auto">
+            <label class="form-label small mb-0">热搜词数</label>
+            <input id="hs-hotword-limit" type="number" class="form-control form-control-sm" value="10" min="1" style="width:5rem">
+          </div>
+          <div class="col-6 col-md-auto">
+            <label class="form-label small mb-0">每词用户数</label>
+            <input id="hs-commenters-per-kw" type="number" class="form-control form-control-sm" value="30" min="1" style="width:5rem">
+          </div>
+          <div class="col-6 col-md-auto">
+            <label class="form-label small mb-0">总 UID 上限</label>
+            <input id="hs-total" type="number" class="form-control form-control-sm" value="200" min="2" style="width:5rem">
+          </div>
+          <div class="col-6 col-md-auto">
+            <label class="form-label small mb-0">速度</label>
+            <select id="hs-speed-mode" class="form-select form-select-sm" style="width:auto">
+              <option value="steady" selected>稳妥档</option>
+              <option value="fast">极速档</option>
+            </select>
+          </div>
+          <div class="col-12 col-md-auto mt-2 mt-md-0">
+            <button type="button" id="hot-sample" class="btn btn-outline-primary btn-sm">开始采样并写入本地</button>
+            <span id="hs-result" class="text-secondary small ms-2"></span>
+          </div>
+        </div>
+        <div id="hs-progress-wrap" class="mb-3 d-none">
+          <div class="d-flex justify-content-between align-items-center mb-1 small text-secondary">
+            <span id="hs-progress-label">—</span>
+            <span id="hs-progress-pct">0%</span>
+          </div>
+          <div class="progress progress-sm">
+            <div id="hs-progress-bar" class="progress-bar bg-primary" role="progressbar" style="width: 0%" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div>
+          </div>
+        </div>
+        <div class="text-secondary small border rounded p-3 bg-light">
+          完成后请打开 <a href="/crawl">抓取微博</a>（页面会显示最新 UID）；本批 UID 预览：<span id="hs-preview" class="font-monospace">—</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="hot-debug-section" class="row row-cards mb-4">
+  <div class="col-12">
+    <div class="card">
+      <div class="card-body">
+        <h3 class="card-title mb-2">热搜调试摘要</h3>
+        <p class="text-secondary small mb-3">可选：查看最近一次采样的汇总。</p>
+        <button type="button" id="hot-debug-refresh" class="btn btn-outline-secondary btn-sm mb-3">
+          <i class="ti ti-refresh me-1"></i> 加载最近摘要
+        </button>
+        <div id="hot-debug-meta" class="text-secondary small"></div>
+        <pre id="hot-debug-content" class="log-box log-box-wide p-3 mt-2 mb-0"></pre>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  const hsBtn = document.getElementById("hot-sample");
+  const hsResult = document.getElementById("hs-result");
+  const hsPreview = document.getElementById("hs-preview");
+  const hsCookie = document.getElementById("hs-cookie");
+  const hsHotwordLimit = document.getElementById("hs-hotword-limit");
+  const hsCommentersPerKw = document.getElementById("hs-commenters-per-kw");
+  const hsTotal = document.getElementById("hs-total");
+  const hsSpeedMode = document.getElementById("hs-speed-mode");
+  const hotDebugBtn = document.getElementById("hot-debug-refresh");
+  const hotDebugMeta = document.getElementById("hot-debug-meta");
+  const hotDebugContent = document.getElementById("hot-debug-content");
+
+  function setHsProgress(data) {
+    const wrap = document.getElementById("hs-progress-wrap");
+    const bar = document.getElementById("hs-progress-bar");
+    const lab = document.getElementById("hs-progress-label");
+    const pctEl = document.getElementById("hs-progress-pct");
+    if (!wrap || !bar) return;
+    wrap.classList.remove("d-none");
+    const p = Math.max(0, Math.min(100, Number(data.progress) || 0));
+    bar.style.width = p + "%";
+    bar.setAttribute("aria-valuenow", String(p));
+    if (lab) lab.textContent = data.progress_label || "";
+    if (pctEl) pctEl.textContent = p + "%";
+    bar.className = "progress-bar " + (
+      data.status === "failed" ? "bg-danger" : data.status === "completed" ? "bg-success" : "bg-primary"
+    );
+  }
+
+  hsBtn.addEventListener("click", async () => {
+    hsResult.textContent = "已提交，执行中...";
+    hsPreview.textContent = "—";
+    setHsProgress({ status: "queued", progress: 0, progress_label: "排队…" });
+    const fd = new FormData();
+    fd.append("cookie", hsCookie.value || "");
+    fd.append("hotword_limit", String(parseInt(hsHotwordLimit.value || "10")));
+    fd.append("commenters_per_keyword", String(parseInt(hsCommentersPerKw.value || "30")));
+    fd.append("total_uid_limit", String(parseInt(hsTotal.value || "200")));
+    fd.append("speed_mode", hsSpeedMode.value || "steady");
+    const resp = await fetch("/api/hot_search_sample", { method: "POST", body: fd });
+    const data = await resp.json();
+    if (!resp.ok) {
+      hsResult.textContent = `失败：${data.error || "unknown"}`;
+      return;
+    }
+    const jobId = data.job_id;
+    const poll = async () => {
+      let jd;
+      try {
+        const jr = await fetch(`/api/jobs/${jobId}`);
+        if (jr.status === 404) {
+          hsResult.textContent = "任务不存在（服务可能已重启），请刷新后重来";
+          return;
+        }
+        if (!jr.ok) {
+          hsResult.textContent = `轮询失败 HTTP ${jr.status}`;
+          return;
+        }
+        jd = await jr.json();
+      } catch (e) {
+        hsResult.textContent = "轮询失败（网络错误）";
+        return;
+      }
+      hsResult.textContent = `状态：${jd.status}`;
+      setHsProgress(jd);
+      if (jd.status === "completed") {
+        const uids = (jd.result && jd.result.user_ids) ? jd.result.user_ids : [];
+        hsPreview.textContent = uids.length ? uids.slice(0, 20).join(",") + (uids.length > 20 ? " …" : "") : "（无）";
+        hsResult.textContent = `完成：${uids.length} 个 UID 已写入本地，抓取页将刷新即可加载`;
+      }
+      if (jd.status === "failed") hsResult.textContent = `失败：${jd.error || "unknown"}`;
+      if (jd.status !== "completed" && jd.status !== "failed") setTimeout(poll, 1500);
+    };
+    poll();
+  });
+
+  hotDebugBtn.addEventListener("click", async () => {
+    hotDebugMeta.textContent = "加载中...";
+    hotDebugContent.textContent = "";
+    const resp = await fetch("/api/hot_search_debug_latest");
+    const data = await resp.json();
+    if (!resp.ok) {
+      hotDebugMeta.textContent = `失败：${data.error || "unknown"}`;
+      return;
+    }
+    const s = data.summary || {};
+    hotDebugMeta.textContent = `文件：${data.path}`;
+    const lines = [];
+    lines.push(`总关键词: ${s.keywords} | 最终UID: ${s.total_unique_uids}`);
+    lines.push(`零微博关键词: ${s.zero_tweet_keywords} | 零评论候选关键词: ${s.zero_commenter_keywords}`);
+    lines.push(`评论总行数: ${s.total_comment_rows} | 评论唯一候选总数: ${s.total_comment_unique_candidates} | 全局重复抽中: ${s.global_duplicate_picks}`);
+    lines.push("");
+    (data.by_keyword || []).forEach((k) => {
+      const cs = k.comment_extract_stats || {};
+      const inter = (k.interaction_candidates_unique !== undefined) ? k.interaction_candidates_unique : (k.commenter_candidates_unique || 0);
+      lines.push(
+        `[${k.keyword_index}] ${k.keyword} | tweet=${k.tweet_ids_collected} authors=${k.tweet_authors_unique || 0} comments=${k.commenter_candidates_unique} pool=${inter} picked=${k.picked_actual} add=${k.added_to_global_unique} dup_global=${k.picked_but_duplicate_globally} comment_rows=${cs.comment_rows || 0} dup_in_kw=${cs.duplicate_uid_rows || 0}`
+      );
+    });
+    hotDebugContent.textContent = lines.join("\n");
+  });
+</script>
+{% endblock %}
