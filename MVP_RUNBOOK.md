@@ -21,6 +21,35 @@ python run_spider.py tweet_by_user_id
 python run_spider.py comment
 ```
 
+### 推荐：三步多维采集（关键词召回 -> 用户资料 -> 历史推文）
+
+为了减少改动核心爬虫代码、同时提升样本覆盖与均衡度，可直接使用根目录脚本：
+
+```bash
+python multidim_crawl.py \
+  --keywords "手机评测,骁龙,AIGC,ETF,原神" \
+  --max-pages 5 \
+  --per-keyword-limit 80 \
+  --total-limit 600 \
+  --append-user-ids
+```
+
+为降低微博搜索 418 风控，脚本默认设置 `WEIBO_SPLIT_BY_HOUR=false`。如需指定时间范围可追加：
+
+```bash
+python multidim_crawl.py \
+  --keywords "AIGC,手机评测" \
+  --max-pages 2 \
+  --start-time "2026-03-01 00:00:00" \
+  --end-time "2026-04-01 23:59:59"
+```
+
+该脚本会自动执行：
+
+- 第一步：`tweet_by_keyword` 召回候选人群；
+- 第二步：从 `output/unified_*.jsonl` 提取并均衡抽样 `user_id`，写入 `input/user_ids.txt`；
+- 第三步：依次执行 `user` 与 `tweet_by_user_id`，得到静态资料 + 历史内容的多维数据。
+
 ## 3) 一键启动 Web 系统
 
 ```bash

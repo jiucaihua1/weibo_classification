@@ -54,10 +54,26 @@ class TweetSpiderByUserID(Spider):
         """
         网页解析
         """
-        data = json.loads(response.text)
-        tweets = data['data']['list']
+        try:
+            data = json.loads(response.text)
+        except Exception:
+            self.logger.warning(f"invalid json in timeline response, skip: {response.url}")
+            return
+        tweets = ((data or {}).get('data') or {}).get('list') or []
+        if not isinstance(tweets, list):
+            self.logger.warning(f"unexpected timeline payload shape, skip: {response.url}")
+            return
         for tweet in tweets:
-            item = parse_tweet_info(tweet)
+            try:
+                item = parse_tweet_info(tweet)
+            except KeyError as exc:
+                self.logger.warning(
+                    f"skip malformed tweet payload missing key={exc} url={response.url}"
+                )
+                continue
+            except Exception:
+                self.logger.warning(f"skip malformed tweet payload url={response.url}")
+                continue
             if item['isLongText']:
                 url = "https://weibo.com/ajax/statuses/longtext?id=" + item['mblogid']
                 yield Request(
