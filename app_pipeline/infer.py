@@ -70,6 +70,16 @@ def infer(
     with open(os.path.join(model_dir, "cluster_label_map.json"), "rt", encoding="utf-8") as f:
         cluster_map = {int(k): v for k, v in json.load(f).items()}
 
+    # 若存在决策树模型，则用它做“分类/可解释预测”（树是用 KMeans 的伪标签训练出来的）
+    tree_path = os.path.join(model_dir, "decision_tree_model.pkl")
+    tree = None
+    if os.path.isfile(tree_path):
+        try:
+            with open(tree_path, "rb") as f:
+                tree = pickle.load(f)
+        except Exception:
+            tree = None
+
     # 尝试加载训练阶段缓存的用户特征（推断阶段不重复做 TextRank + BERT）
     cached_ids_path = os.path.join(model_dir, "user_ids.pkl")
     cached_feat_path = os.path.join(model_dir, "user_features.npy")
@@ -128,17 +138,24 @@ def infer(
     if not user_ids:
         raise RuntimeError("infer: user_ids empty")
 
-    # 预测簇
-    cluster_ids = km.predict(x).astype(int)
-    centroids = km.cluster_centers_.astype(np.float32, copy=False)
+    # 预测簇（训练阶段对特征做了行归一化，所以推断也要一致）
     x_norm = x / (np.linalg.norm(x, axis=1, keepdims=True) + 1e-12)
+    if tree is not None:
+        cluster_ids = tree.predict(x_norm).astype(int)
+    else:
+        cluster_ids = km.predict(x_norm).astype(int)
+    centroids = km.cluster_centers_.astype(np.float32, copy=False)
     c_norm = centroids / (np.linalg.norm(centroids, axis=1, keepdims=True) + 1e-12)
     cos_scores = np.sum(x_norm * c_norm[cluster_ids], axis=1)  # (n_users,)
 
     idx_map = {uid: i for i, uid in enumerate(user_ids)}
 
+    print(f"[INFER] total_feature_users={len(idx_map)}", flush=True)
+
     # 证据抽取：流式遍历 bundle users，匹配到已通过过滤的 user_id
     profiles: List[Dict] = []
+    processed_outputs = 0
+    target_total = max(1, len(idx_map))
     for user_block in iter_crawl_bundle_users(unified_path):
         if not isinstance(user_block, dict):
             continue
@@ -206,6 +223,9 @@ def infer(
                 "evidence": evidence,
             }
         )
+        processed_outputs += 1
+        if processed_outputs % 20 == 0:
+            print(f"[INFER] profiles={processed_outputs}/{target_total}", flush=True)
 
     profiles.sort(key=lambda x: x["sample_size"], reverse=True)
     os.makedirs(os.path.dirname(output_file), exist_ok=True)

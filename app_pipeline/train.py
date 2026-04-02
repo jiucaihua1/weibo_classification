@@ -3,7 +3,7 @@ import json
 import os
 import pickle
 from collections import Counter, defaultdict
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from sklearn.cluster import KMeans
@@ -36,6 +36,32 @@ def _cosine_similarity_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     a_norm = a / (np.linalg.norm(a, axis=1, keepdims=True) + 1e-12)
     b_norm = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-12)
     return a_norm @ b_norm.T
+
+
+def _normalize_rows(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """Row-wise L2 normalization. Used so cosine-ish distances behave well with KMeans."""
+    return x / (np.linalg.norm(x, axis=1, keepdims=True) + eps)
+
+
+def _load_features_and_ids(
+    features_path: str,
+    user_ids_path: str,
+) -> Tuple[List[str], np.ndarray]:
+    if not os.path.isfile(features_path):
+        raise FileNotFoundError(f"features not found: {features_path}")
+    if not os.path.isfile(user_ids_path):
+        raise FileNotFoundError(f"user_ids not found: {user_ids_path}")
+
+    x = np.load(features_path).astype(np.float32, copy=False)
+    with open(user_ids_path, "rb") as f:
+        user_ids = pickle.load(f)
+    if not isinstance(user_ids, list):
+        raise ValueError("user_ids.pkl must contain a list")
+    if x.ndim != 2:
+        raise ValueError(f"features must be 2D, got {x.shape}")
+    if x.shape[0] != len(user_ids):
+        raise ValueError(f"features rows {x.shape[0]} != user_ids len {len(user_ids)}")
+    return [str(u) for u in user_ids], x
 
 
 def map_clusters_to_labels_by_hint_embeddings(
@@ -75,85 +101,140 @@ def map_clusters_to_labels_by_hint_embeddings(
 
 
 def train(
-    unified_path: str,
+    bundle_path: str,
     output_dir: str,
-    n_clusters: int = 8,
     *,
+    # read features produced by step3
+    features_path: Optional[str] = None,
+    user_ids_path: Optional[str] = None,
+    # auto k
+    k_min: int = 2,
+    k_max: int = 10,
+    # fallback options (if features not provided)
     top_k_keywords: int = 10,
     min_chars: int = 200,
     device: str = "cuda",
     encode_batch_size: int = 64,
     user_batch_size: int = 64,
     model_name: str = "shibing624/text2vec-base-chinese",
+    # tree
+    tree_max_depth: int = 8,
 ) -> Dict:
-    """
-    覆盖替换：用 TextRank + text2vec 用户向量替换 TF-IDF。
-    """
-    cfg = FeatureExtractionConfig(
-        top_k=top_k_keywords,
-        min_chars=min_chars,
-        encode_batch_size=encode_batch_size,
-        device=device,
-        model_name=model_name,
-        user_batch_size=user_batch_size,
-    )
-    user_ids, x = extract_user_features(unified_path, cfg=cfg)
+    # Make HF downloads use mirror by default (helps when model cache is missing).
+    os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
+    if features_path and user_ids_path:
+        user_ids, x = _load_features_and_ids(features_path, user_ids_path)
+    else:
+        # fallback: re-extract (slow, but keeps script usable standalone)
+        cfg = FeatureExtractionConfig(
+            top_k=top_k_keywords,
+            min_chars=min_chars,
+            encode_batch_size=encode_batch_size,
+            device=device,
+            model_name=model_name,
+            user_batch_size=user_batch_size,
+        )
+        user_ids, x = extract_user_features(bundle_path, cfg=cfg)
+
     if x.shape[0] < 2:
         raise ValueError("用户特征太少，无法聚类。")
 
-    k = min(n_clusters, x.shape[0])
-    km = KMeans(n_clusters=k, random_state=42, n_init=10)
-    cluster_ids = km.fit_predict(x)
+    x_norm = _normalize_rows(x.astype(np.float32, copy=False))
 
-    # label 映射
+    # auto k search by silhouette (cosine distance)
+    k_max = min(int(k_max), int(x_norm.shape[0]))
+    k_min = max(2, int(k_min))
+    if k_max < k_min:
+        k_max = k_min
+
+    best_k = k_min
+    best_score = -1.0
+    best_km: Optional[KMeans] = None
+    k_search_results: List[Dict[str, float]] = []
+
+    for k in range(k_min, k_max + 1):
+        if k <= 1:
+            continue
+        km = KMeans(n_clusters=k, random_state=42, n_init=10)
+        cluster_ids = km.fit_predict(x_norm)
+        if len(set(cluster_ids)) < 2:
+            continue
+        try:
+            score = float(silhouette_score(x_norm, cluster_ids, metric="cosine"))
+        except Exception:
+            score = -1.0
+        print(f"[KSEARCH] k={k} silhouette={score}", flush=True)
+        k_search_results.append({"k": float(k), "silhouette_score": score})
+        if score > best_score:
+            best_score = score
+            best_k = k
+            best_km = km
+            print(f"[KSEARCH] best_so_far_k={best_k} best_score={best_score}", flush=True)
+
+    if best_km is None:
+        # fallback: just pick k_min
+        best_km = KMeans(n_clusters=best_k, random_state=42, n_init=10).fit(x_norm)
+        cluster_ids = best_km.labels_
+    else:
+        cluster_ids = best_km.predict(x_norm)
+
+    print(f"[KSEARCH] best_k={best_k} best_score={best_score}", flush=True)
+
     cluster_label_map = map_clusters_to_labels_by_hint_embeddings(
-        km.cluster_centers_,
+        best_km.cluster_centers_,
         device=device,
         embed_model_name=model_name,
     )
-
-    score = silhouette_score(x, cluster_ids) if len(set(cluster_ids)) >= 2 else -1.0
+    print("[LABEL] cluster_label_map computed", flush=True)
     coverage = len(set(cluster_label_map.values())) / float(len(INTEREST_LABELS))
 
-    # 训练决策树（伪标签来自 KMeans）用于可解释分类
+    # decision tree for interpretability (pseudo-label = cluster_id)
     tree = DecisionTreeClassifier(
-        max_depth=8,
+        max_depth=int(tree_max_depth),
         random_state=42,
         min_samples_leaf=2,
     )
-    tree.fit(x, cluster_ids)
+    tree.fit(x_norm, cluster_ids)
+    print("[TREE] decision_tree fitted", flush=True)
 
     os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, "kmeans_model.pkl"), "wb") as f:
-        pickle.dump(km, f)
+        pickle.dump(best_km, f)
+    with open(os.path.join(output_dir, "kmeans_k.json"), "wt", encoding="utf-8") as f:
+        json.dump({"best_k": int(best_k), "best_silhouette": float(best_score)}, f, ensure_ascii=False, indent=2)
     with open(os.path.join(output_dir, "cluster_label_map.json"), "wt", encoding="utf-8") as f:
         json.dump(cluster_label_map, f, ensure_ascii=False, indent=2)
     with open(os.path.join(output_dir, "decision_tree_model.pkl"), "wb") as f:
         pickle.dump(tree, f)
+    print("[SAVE] clustering artifacts saved", flush=True)
 
+    # persistence of clustering results
+    user_cluster_map = {uid: int(cid) for uid, cid in zip(user_ids, cluster_ids)}
     with open(os.path.join(output_dir, "user_cluster.json"), "wt", encoding="utf-8") as f:
-        json.dump({uid: int(cid) for uid, cid in zip(user_ids, cluster_ids)}, f, ensure_ascii=False, indent=2)
+        json.dump(user_cluster_map, f, ensure_ascii=False, indent=2)
+    np.save(os.path.join(output_dir, "cluster_ids.npy"), cluster_ids.astype(np.int32, copy=False))
 
-    # 缓存用户特征，推断阶段可直接复用（避免再跑 TextRank + BERT）
-    np.save(os.path.join(output_dir, "user_features.npy"), x.astype(np.float32, copy=False))
+    # cache features for infer stage
+    np.save(os.path.join(output_dir, "user_features.npy"), x_norm.astype(np.float32, copy=False))
     with open(os.path.join(output_dir, "user_ids.pkl"), "wb") as f:
         pickle.dump(user_ids, f)
     with open(os.path.join(output_dir, "source_bundle_path.txt"), "wt", encoding="utf-8") as f:
-        f.write(os.path.abspath(unified_path))
+        f.write(os.path.abspath(bundle_path))
 
     label_counter = Counter(cluster_label_map[int(c)] for c in cluster_ids)
     metrics = {
-        "n_users": int(x.shape[0]),
-        "n_clusters": int(k),
-        "silhouette_score": float(score),
+        "n_users": int(x_norm.shape[0]),
+        "n_clusters": int(best_k),
+        "silhouette_score": float(best_score),
         "label_coverage": float(coverage),
         "label_distribution": dict(label_counter),
-        "decision_tree_max_depth": 8,
-        "embed_dim": int(x.shape[1]),
-        "top_k_keywords": int(top_k_keywords),
-        "min_chars": int(min_chars),
+        "decision_tree_max_depth": int(tree_max_depth),
+        "embed_dim": int(x_norm.shape[1]),
+        "k_search_results": k_search_results,
         "device": device,
         "model_name": model_name,
+        "features_loaded": bool(features_path and user_ids_path),
     }
     with open(os.path.join(output_dir, "metrics.json"), "wt", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
@@ -161,24 +242,38 @@ def train(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train TextRank + text2vec + KMeans hybrid interest classifier.")
-    parser.add_argument("--input", required=True, help="Path to weibo_crawl_latest.json bundle.")
-    parser.add_argument("--output-dir", default="output/ml_artifacts", help="Model output directory.")
-    parser.add_argument("--clusters", type=int, default=8, help="Number of KMeans clusters.")
-    parser.add_argument("--top-k", type=int, default=10, help="TextRank topK keywords per user.")
-    parser.add_argument("--min-chars", type=int, default=200, help="Drop users if cleaned text length < threshold.")
+    PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    DEFAULT_FEATURES = os.path.join(PROJECT_ROOT, "output", "user_features_text2vec.npy")
+    DEFAULT_IDS = os.path.join(PROJECT_ROOT, "output", "user_ids_text2vec.pkl")
+    parser = argparse.ArgumentParser(description="KMeans cluster on text2vec user features, with auto-k.")
+    parser.add_argument("--input", required=True, help="bundle path for evidence (e.g. output/weibo_crawl_latest.json)")
+    parser.add_argument("--output-dir", default=os.path.join(PROJECT_ROOT, "output", "ml_artifacts"), help="Model output directory.")
+    parser.add_argument("--features", default=DEFAULT_FEATURES, help="user_features_text2vec.npy")
+    parser.add_argument("--user-ids", default=DEFAULT_IDS, help="user_ids_text2vec.pkl")
+    parser.add_argument("--k-min", type=int, default=2, help="min k for auto selection")
+    parser.add_argument("--k-max", type=int, default=10, help="max k for auto selection")
+    parser.add_argument("--tree-max-depth", type=int, default=8, help="decision tree max depth")
+
+    # fallback options (used only if features not provided / missing)
+    parser.add_argument("--top-k", type=int, default=10, help="TextRank topK keywords per user (fallback mode)")
+    parser.add_argument("--min-chars", type=int, default=200, help="Drop users if cleaned text length < threshold (fallback mode)")
     parser.add_argument("--device", type=str, default="cuda", help="cuda for RTX3050 acceleration.")
-    parser.add_argument("--encode-batch-size", type=int, default=64, help="sentence-transformers encode batch_size.")
-    parser.add_argument("--user-batch-size", type=int, default=64, help="How many users per encode flush.")
+    parser.add_argument("--encode-batch-size", type=int, default=64, help="sentence-transformers encode batch_size (fallback mode)")
+    parser.add_argument("--user-batch-size", type=int, default=64, help="How many users per encode flush (fallback mode)")
     args = parser.parse_args()
+
     result = train(
         args.input,
         args.output_dir,
-        n_clusters=args.clusters,
-        top_k_keywords=args.top_k,
-        min_chars=args.min_chars,
+        features_path=args.features,
+        user_ids_path=args.user_ids,
+        k_min=int(args.k_min),
+        k_max=int(args.k_max),
+        tree_max_depth=int(args.tree_max_depth),
         device=args.device,
-        encode_batch_size=args.encode_batch_size,
-        user_batch_size=args.user_batch_size,
+        top_k_keywords=int(args.top_k),
+        min_chars=int(args.min_chars),
+        encode_batch_size=int(args.encode_batch_size),
+        user_batch_size=int(args.user_batch_size),
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))

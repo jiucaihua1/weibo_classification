@@ -1,10 +1,11 @@
 {% extends "layout.html" %}
-{% block title %}训练与画像 · 微博兴趣看板{% endblock %}
+{% block title %}聚类与画像 · 微博兴趣看板{% endblock %}
 {% block page_pretitle %}Step 2{% endblock %}
-{% block page_title %}训练并生成画像{% endblock %}
+{% block page_title %}聚类并生成画像{% endblock %}
 {% block page_sub %}
 <div class="text-secondary mt-1">
-  默认读取本地 <code>{{ workspace.train_input_default }}</code>（与「抓取微博」输出一致）。若文件不存在请先完成抓取或修改下方路径。
+  聚类直接读取你已生成的 <code>output/user_features_text2vec.npy</code>（无需再次清洗/关键词/BERT）。
+  证据与画像输出仍会读取 <code>{{ workspace.train_input_default }}</code>。
 </div>
 {% endblock %}
 
@@ -16,18 +17,28 @@
         <form id="train-form">
           <div class="row g-3 mb-4">
             <div class="col-6 col-md-3">
-              <label class="form-label fw-medium">聚类数</label>
-              <input name="clusters" type="number" class="form-control" value="2" min="1">
+              <label class="form-label fw-medium">k_min</label>
+              <input name="k_min" type="number" class="form-control" value="2" min="2">
             </div>
-            <div class="col-12 col-md-9">
+            <div class="col-6 col-md-3">
+              <label class="form-label fw-medium">k_max</label>
+              <input name="k_max" type="number" class="form-control" value="10" min="2">
+            </div>
+            <div class="col-12 col-md-6">
               <label class="form-label fw-medium">训练输入文件</label>
               <input type="text" name="input_file" class="form-control font-monospace small" value="{{ workspace.train_input_default }}" placeholder="output/weibo_crawl_latest.json 或绝对路径">
               <div class="text-secondary small mt-1">相对路径以项目根目录为准。</div>
             </div>
           </div>
           <div class="btn-list flex-wrap mb-3">
-            <button type="button" id="btn-train" class="btn btn-success">
-              <i class="ti ti-rocket me-1"></i> 开始训练与推断
+            <button type="button" id="btn-cluster" class="btn btn-primary">
+              <i class="ti ti-flame me-1"></i> ① KMeans 聚类（自动选 k）
+            </button>
+            <button type="button" id="btn-infer" class="btn btn-success">
+              <i class="ti ti-rocket me-1"></i> ② 生成画像（infer）
+            </button>
+            <button type="button" id="btn-cluster-infer" class="btn btn-warning">
+              <i class="ti ti-sparkles me-1"></i> ③ 一键聚类+生成画像
             </button>
             <a href="/crawl" class="btn btn-outline-secondary">上一步：抓取</a>
             <a href="/profiles" class="btn btn-outline-primary">查看画像表</a>
@@ -50,6 +61,47 @@
         <pre id="job-logs" class="log-box p-3 mt-2 mb-0"></pre>
       </div>
     </div>
+
+    <div class="card mt-3">
+      <div class="card-header">
+        聚类结果预览
+      </div>
+      <div class="card-body">
+        <div id="cluster-preview-empty" class="text-secondary small">
+          尚未生成聚类结果。请先点击① KMeans 聚类。
+        </div>
+        <div id="cluster-preview-wrap" class="d-none">
+          <div class="row g-3">
+            <div class="col-6 col-md-3">
+              <div class="text-secondary small">用户数</div>
+              <div id="cp-n-users" class="h2 mb-0">—</div>
+            </div>
+            <div class="col-6 col-md-3">
+              <div class="text-secondary small">最佳 k / 簇数</div>
+              <div id="cp-best-k" class="h2 mb-0">—</div>
+            </div>
+            <div class="col-6 col-md-3">
+              <div class="text-secondary small">轮廓系数</div>
+              <div id="cp-silhouette" class="h2 mb-0">—</div>
+            </div>
+            <div class="col-6 col-md-3">
+              <div class="text-secondary small">标签覆盖率</div>
+              <div id="cp-label-coverage" class="h2 mb-0">—</div>
+            </div>
+          </div>
+
+          <div class="mt-3">
+            <div class="text-secondary small mb-1">标签分布（兴趣标签->数量）</div>
+            <pre id="cp-label-distribution" class="log-box p-3 mb-0"></pre>
+          </div>
+
+          <div class="mt-3">
+            <div class="text-secondary small mb-1">k 搜索结果（按 silhouette）</div>
+            <pre id="cp-k-search" class="log-box p-3 mb-0"></pre>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 {% endblock %}
@@ -60,6 +112,50 @@
   const statusEl = document.getElementById("job-status");
   const logsEl = document.getElementById("job-logs");
   let timer = null;
+  let reloadOnDone = false;
+  let lastAction = null; // "cluster" | "infer"
+
+  function fmtMaybeNumber(v) {
+    if (v === null || v === undefined || v === "") return "—";
+    if (typeof v === "number") return String(v);
+    const s = String(v);
+    return s;
+  }
+
+  async function refreshClusterPreview() {
+    const emptyEl = document.getElementById("cluster-preview-empty");
+    const wrap = document.getElementById("cluster-preview-wrap");
+    try {
+      const resp = await fetch("/api/cluster_preview");
+      if (!resp.ok) {
+        wrap.classList.add("d-none");
+        emptyEl.classList.remove("d-none");
+        return;
+      }
+      const data = await resp.json();
+      const metrics = data.metrics || {};
+      const kinfo = data.kinfo || {};
+
+      document.getElementById("cp-n-users").textContent = fmtMaybeNumber(metrics.n_users);
+      // n_clusters 可能不存在时，用 kmeans_k.json 的 best_k
+      const bestK = (metrics.n_clusters !== undefined && metrics.n_clusters !== null) ? metrics.n_clusters : kinfo.best_k;
+      document.getElementById("cp-best-k").textContent = fmtMaybeNumber(bestK);
+      document.getElementById("cp-silhouette").textContent = fmtMaybeNumber(metrics.silhouette_score ?? kinfo.best_silhouette);
+      const cov = metrics.label_coverage;
+      document.getElementById("cp-label-coverage").textContent = cov === undefined || cov === null ? "—" : (Number(cov) * 100).toFixed(1) + "%";
+
+      const dist = metrics.label_distribution || {};
+      document.getElementById("cp-label-distribution").textContent = JSON.stringify(dist, null, 2);
+
+      const ks = metrics.k_search_results || [];
+      document.getElementById("cp-k-search").textContent = JSON.stringify(ks, null, 2);
+
+      emptyEl.classList.add("d-none");
+      wrap.classList.remove("d-none");
+    } catch (e) {
+      // ignore
+    }
+  }
 
   function stopJobPoll() {
     if (timer) {
@@ -111,18 +207,26 @@
     logsEl.scrollTop = logsEl.scrollHeight;
     if (data.status === "completed" || data.status === "failed") {
       stopJobPoll();
-      if (data.status === "completed") setTimeout(() => location.reload(), 800);
+      if (data.status === "completed") {
+        if (lastAction === "cluster") {
+          refreshClusterPreview();
+        }
+        if (reloadOnDone) setTimeout(() => location.reload(), 800);
+      }
     }
   }
 
-  document.getElementById("btn-train").addEventListener("click", () => {
+  document.getElementById("btn-cluster").addEventListener("click", () => {
     const fd = new FormData();
-    fd.append("clusters", form.querySelector('input[name="clusters"]').value || "2");
     fd.append("input_file", form.querySelector('input[name="input_file"]').value || "");
+    fd.append("k_min", form.querySelector('input[name="k_min"]').value || "2");
+    fd.append("k_max", form.querySelector('input[name="k_max"]').value || "10");
+    lastAction = "cluster";
+    reloadOnDone = false;
     statusEl.textContent = "状态: submitting...";
     logsEl.textContent = "";
-    setJobProgress({ status: "queued", progress: 0, progress_label: "提交任务…" });
-    fetch("/api/train", { method: "POST", body: fd }).then(async (resp) => {
+    setJobProgress({ status: "queued", progress: 0, progress_label: "提交聚类任务…" });
+    fetch("/api/cluster_text2vec", { method: "POST", body: fd }).then(async (resp) => {
       const data = await resp.json();
       if (!resp.ok) {
         statusEl.textContent = `状态: failed | ${data.error || "submit failed"}`;
@@ -134,5 +238,52 @@
       pollJob(data.job_id);
     });
   });
+
+  document.getElementById("btn-infer").addEventListener("click", () => {
+    const fd = new FormData();
+    fd.append("input_file", form.querySelector('input[name="input_file"]').value || "");
+    lastAction = "infer";
+    reloadOnDone = true;
+    statusEl.textContent = "状态: submitting...";
+    logsEl.textContent = "";
+    setJobProgress({ status: "queued", progress: 0, progress_label: "提交生成画像任务…" });
+    fetch("/api/infer_text2vec", { method: "POST", body: fd }).then(async (resp) => {
+      const data = await resp.json();
+      if (!resp.ok) {
+        statusEl.textContent = `状态: failed | ${data.error || "submit failed"}`;
+        return;
+      }
+      statusEl.textContent = `状态: queued | job=${data.job_id}`;
+      stopJobPoll();
+      timer = setInterval(() => pollJob(data.job_id), 1500);
+      pollJob(data.job_id);
+    });
+  });
+
+  document.getElementById("btn-cluster-infer").addEventListener("click", () => {
+    const fd = new FormData();
+    fd.append("input_file", form.querySelector('input[name="input_file"]').value || "");
+    fd.append("k_min", form.querySelector('input[name="k_min"]').value || "2");
+    fd.append("k_max", form.querySelector('input[name="k_max"]').value || "10");
+    lastAction = "cluster";
+    reloadOnDone = true;
+    statusEl.textContent = "状态: submitting...";
+    logsEl.textContent = "";
+    setJobProgress({ status: "queued", progress: 0, progress_label: "提交一键任务…" });
+    fetch("/api/cluster_and_infer_text2vec", { method: "POST", body: fd }).then(async (resp) => {
+      const data = await resp.json();
+      if (!resp.ok) {
+        statusEl.textContent = `状态: failed | ${data.error || "submit failed"}`;
+        return;
+      }
+      statusEl.textContent = `状态: queued | job=${data.job_id}`;
+      stopJobPoll();
+      timer = setInterval(() => pollJob(data.job_id), 1500);
+      pollJob(data.job_id);
+    });
+  });
+
+  // 首次加载页面时尝试刷新聚类预览（如果你之前已经做过聚类）
+  refreshClusterPreview();
 </script>
 {% endblock %}

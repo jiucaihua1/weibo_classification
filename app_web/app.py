@@ -1,9 +1,11 @@
 import glob
 import json
 import os
+import re
 import subprocess
 import threading
 import uuid
+import time
 from collections import Counter
 from datetime import datetime
 
@@ -196,6 +198,88 @@ def _run_cmd(job_id: str, cmd: list[str], cwd: str, env: dict):
         raise RuntimeError(f"Command failed: {' '.join(cmd)}")
 
 
+def _run_cmd_stream(
+    job_id: str,
+    cmd: list[str],
+    cwd: str,
+    env: dict,
+    *,
+    progress_updater=None,
+):
+    """
+    Stream stdout/stderr line-by-line into job logs so the UI doesn't look stuck.
+    progress_updater(line) -> dict|None (passed to _update_job)
+    """
+    _append_job_log(job_id, f"[RUN] {' '.join(cmd)}")
+    raw_timeout = (env or {}).get("WEB_CMD_TIMEOUT_SEC") or os.environ.get("WEB_CMD_TIMEOUT_SEC")
+    timeout_sec = None
+    if raw_timeout not in (None, ""):
+        try:
+            timeout_sec = float(raw_timeout)
+            if timeout_sec <= 0:
+                timeout_sec = None
+        except (TypeError, ValueError):
+            timeout_sec = None
+
+    env2 = dict(env or {})
+    env2["PYTHONUNBUFFERED"] = "1"
+
+    start = time.time()
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        env=env2,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+
+    try:
+        while True:
+            if timeout_sec is not None and (time.time() - start) > timeout_sec:
+                proc.kill()
+                _append_job_log(job_id, f"子进程超时（WEB_CMD_TIMEOUT_SEC={timeout_sec}），已终止")
+                raise RuntimeError(f"命令超时（>{timeout_sec}s）: {' '.join(cmd)}")
+
+            line = proc.stdout.readline()
+            if line:
+                line = line.rstrip("\r\n")
+                if line:
+                    _append_job_log(job_id, line)
+                if progress_updater:
+                    try:
+                        upd = progress_updater(line)
+                        if upd:
+                            _update_job(job_id, **upd)
+                    except Exception:
+                        pass
+                continue
+
+            # no line available; check if finished
+            if proc.poll() is not None:
+                break
+            time.sleep(0.1)
+
+        # drain remaining output
+        for line in proc.stdout:
+            line = line.rstrip("\r\n")
+            if line:
+                _append_job_log(job_id, line)
+    finally:
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+        except Exception:
+            pass
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"Command failed: {' '.join(cmd)}")
+
+
 def _get_hot_search_speed_profile(speed_mode: str) -> dict:
     return service_get_hot_search_speed_profile(speed_mode)
 
@@ -317,36 +401,256 @@ def _resolve_training_input(path: str) -> str:
     return os.path.normpath(os.path.join(PROJECT_DIR, p))
 
 
-def _train_pipeline_job(job_id: str, clusters: int, input_path: str):
+def _cluster_text2vec_job(job_id: str, input_path: str, k_min: int, k_max: int):
     try:
-        _update_job(job_id, status="running", progress=8, progress_label="检查训练输入…")
+        _update_job(job_id, status="running", progress=8, progress_label="加载特征与搜索 k…")
         path = _resolve_training_input(input_path)
         if not os.path.isfile(path):
-            raise RuntimeError(f"训练输入文件不存在: {path}，请先执行「抓取微博」。")
+            raise RuntimeError(f"bundle not found: {path}")
+
         env = os.environ.copy()
-        _update_job(job_id, progress=25, progress_label="① 聚类训练（train）…")
-        _run_cmd(
+        model_dir = os.path.join("output", "ml_artifacts")
+        _update_job(job_id, progress=25, progress_label="① KMeans 聚类（自动选 k）…")
+
+        den = max(1, int(k_max) - int(k_min))
+
+        def _progress_updater(line: str):
+            if not line.startswith("[KSEARCH]"):
+                return None
+            # Examples:
+            # [KSEARCH] k=3 silhouette=0.1
+            # [KSEARCH] best_so_far_k=3 best_score=0.12
+            # [KSEARCH] best_k=3 best_score=0.12
+            m = re.search(r"k=(\d+)", line)
+            if not m:
+                return None
+            k = int(m.group(1))
+            idx = k - int(k_min)
+            pct = idx / float(den)
+            progress = 25 + int(max(0.0, min(1.0, pct)) * 60)
+            return {
+                "progress": max(25, min(85, progress)),
+                "progress_label": line.replace("[KSEARCH] ", ""),
+            }
+
+        _run_cmd_stream(
             job_id,
-            [PYTHON_BIN, "-m", "app_pipeline.train", "--input", path, "--output-dir", os.path.join("output", "ml_artifacts"), "--clusters", str(clusters)],
+            [
+                PYTHON_BIN,
+                "-m",
+                "app_pipeline.train",
+                "--input",
+                path,
+                "--output-dir",
+                model_dir,
+                "--k-min",
+                str(k_min),
+                "--k-max",
+                str(k_max),
+            ],
             PROJECT_DIR,
             env,
+            progress_updater=_progress_updater,
         )
-        _update_job(job_id, progress=55, progress_label="② 推断画像（infer）…")
-        _run_cmd(
-            job_id,
-            [PYTHON_BIN, "-m", "app_pipeline.infer", "--input", path, "--model-dir", os.path.join("output", "ml_artifacts"), "--output", os.path.join("output", "user_interest_profiles.json")],
-            PROJECT_DIR,
-            env,
-        )
-        _append_job_log(job_id, f"Train/infer done. Input: {path}")
+
         _update_job(
             job_id,
             status="completed",
             progress=100,
-            progress_label="完成",
+            progress_label="聚类完成",
             completed_at=datetime.now().isoformat(timespec="seconds"),
-            result={"input_file": path, "profiles": os.path.join("output", "user_interest_profiles.json")},
+            result={
+                "model_dir": model_dir,
+                "k_search_note": "cluster results saved (user_cluster.json / kmeans_k.json)",
+            },
         )
+    except Exception as exc:
+        _update_job(
+            job_id,
+            status="failed",
+            error=str(exc),
+            progress_label="失败",
+            completed_at=datetime.now().isoformat(timespec="seconds"),
+        )
+        _append_job_log(job_id, f"Failed: {exc}")
+
+
+def _infer_text2vec_job(job_id: str, input_path: str):
+    try:
+        _update_job(job_id, status="running", progress=8, progress_label="读取聚类模型…")
+        path = _resolve_training_input(input_path)
+        if not os.path.isfile(path):
+            raise RuntimeError(f"bundle not found: {path}")
+
+        env = os.environ.copy()
+        model_dir = os.path.join("output", "ml_artifacts")
+        out_path = os.path.join("output", "user_interest_profiles.json")
+        _update_job(job_id, progress=35, progress_label="② 生成兴趣画像（infer）…")
+
+        def _progress_updater(line: str):
+            if not line.startswith("[INFER]"):
+                return None
+            # [INFER] profiles=20/523
+            m = re.search(r"profiles=(\d+)/(\d+)", line)
+            if not m:
+                return None
+            done = int(m.group(1))
+            total = int(m.group(2))
+            if total <= 0:
+                return None
+            pct = done / float(total)
+            progress = 35 + int(max(0.0, min(1.0, pct)) * 55)
+            return {"progress": max(35, min(90, progress)), "progress_label": line.replace("[INFER] ", "")}
+
+        _run_cmd_stream(
+            job_id,
+            [
+                PYTHON_BIN,
+                "-m",
+                "app_pipeline.infer",
+                "--input",
+                path,
+                "--model-dir",
+                model_dir,
+                "--output",
+                out_path,
+            ],
+            PROJECT_DIR,
+            env,
+            progress_updater=_progress_updater,
+        )
+        _update_job(
+            job_id,
+            status="completed",
+            progress=100,
+            progress_label="画像生成完成",
+            completed_at=datetime.now().isoformat(timespec="seconds"),
+            result={"profiles": out_path},
+        )
+    except Exception as exc:
+        _update_job(
+            job_id,
+            status="failed",
+            error=str(exc),
+            progress_label="失败",
+            completed_at=datetime.now().isoformat(timespec="seconds"),
+        )
+        _append_job_log(job_id, f"Failed: {exc}")
+
+
+def _cluster_and_infer_text2vec_job(job_id: str, input_path: str, k_min: int, k_max: int):
+    """
+    一键流程：① KMeans 自动选 k -> ② infer 生成兴趣画像。
+    """
+    try:
+        _update_job(job_id, status="running", progress=8, progress_label="一键：加载特征…")
+        path = _resolve_training_input(input_path)
+        if not os.path.isfile(path):
+            raise RuntimeError(f"bundle not found: {path}")
+
+        env = os.environ.copy()
+        model_dir = os.path.join("output", "ml_artifacts")
+        out_path = os.path.join("output", "user_interest_profiles.json")
+
+        # stage 1: kmeans
+        _update_job(job_id, progress=25, progress_label="一键：KMeans 自动选 k…")
+        den = max(1, int(k_max) - int(k_min))
+
+        def _progress_updater(line: str):
+            if not line.startswith("[KSEARCH]"):
+                return None
+            m = re.search(r"k=(\d+)", line)
+            if not m:
+                return None
+            k = int(m.group(1))
+            idx = k - int(k_min)
+            pct = idx / float(den)
+            progress = 25 + int(max(0.0, min(1.0, pct)) * 60)
+            return {"progress": max(25, min(85, progress)), "progress_label": line.replace("[KSEARCH] ", "")}
+
+        _run_cmd_stream(
+            job_id,
+            [
+                PYTHON_BIN,
+                "-m",
+                "app_pipeline.train",
+                "--input",
+                path,
+                "--output-dir",
+                model_dir,
+                "--k-min",
+                str(k_min),
+                "--k-max",
+                str(k_max),
+            ],
+            PROJECT_DIR,
+            env,
+            progress_updater=_progress_updater,
+        )
+
+        # stage 2: infer
+        _update_job(job_id, progress=85, progress_label="一键：生成兴趣画像（infer）…")
+
+        def _progress_updater2(line: str):
+            if not line.startswith("[INFER]"):
+                return None
+            m = re.search(r"profiles=(\d+)/(\d+)", line)
+            if not m:
+                return None
+            done = int(m.group(1))
+            total = int(m.group(2))
+            if total <= 0:
+                return None
+            pct = done / float(total)
+            progress = 85 + int(max(0.0, min(1.0, pct)) * 12)
+            return {"progress": max(85, min(98, progress)), "progress_label": line.replace("[INFER] ", "")}
+
+        _run_cmd_stream(
+            job_id,
+            [
+                PYTHON_BIN,
+                "-m",
+                "app_pipeline.infer",
+                "--input",
+                path,
+                "--model-dir",
+                model_dir,
+                "--output",
+                out_path,
+            ],
+            PROJECT_DIR,
+            env,
+            progress_updater=_progress_updater2,
+        )
+
+        _update_job(
+            job_id,
+            status="completed",
+            progress=100,
+            progress_label="一键完成",
+            completed_at=datetime.now().isoformat(timespec="seconds"),
+            result={"profiles": out_path, "model_dir": model_dir},
+        )
+    except Exception as exc:
+        _update_job(
+            job_id,
+            status="failed",
+            error=str(exc),
+            progress_label="失败",
+            completed_at=datetime.now().isoformat(timespec="seconds"),
+        )
+        _append_job_log(job_id, f"Failed: {exc}")
+
+
+def _train_pipeline_job(job_id: str, clusters: int, input_path: str):
+    try:
+        # legacy endpoint: use clusters as k_max
+        k_min = 2
+        k_max = max(2, int(clusters))
+        _cluster_text2vec_job(job_id, input_path=input_path, k_min=k_min, k_max=k_max)
+        if jobs.get(job_id, {}).get("status") != "completed":
+            return
+        _infer_text2vec_job(job_id, input_path=input_path)
     except Exception as exc:
         _update_job(
             job_id,
@@ -442,6 +746,47 @@ def api_profile(user_id: str):
         if item.get("user_id") == user_id:
             return item
     raise HTTPException(status_code=404, detail="user not found")
+
+
+@app.get("/api/cluster_preview")
+def api_cluster_preview():
+    """
+    聚类结果预览：用于 train 页面展示最佳 k / 分布等信息。
+    如果尚未聚类，返回 404。
+    """
+    model_dir = os.path.join(OUTPUT_DIR, "ml_artifacts")
+    metrics_path = os.path.join(model_dir, "metrics.json")
+    k_path = os.path.join(model_dir, "kmeans_k.json")
+    user_cluster_path = os.path.join(model_dir, "user_cluster.json")
+
+    if not os.path.isfile(metrics_path) and not os.path.isfile(k_path):
+        raise HTTPException(status_code=404, detail="cluster artifacts not found")
+
+    metrics = {}
+    if os.path.isfile(metrics_path):
+        with open(metrics_path, "rt", encoding="utf-8", errors="replace") as f:
+            metrics = json.load(f)
+
+    kinfo = {}
+    if os.path.isfile(k_path):
+        with open(k_path, "rt", encoding="utf-8", errors="replace") as f:
+            kinfo = json.load(f)
+
+    user_cluster = {}
+    cluster_sizes = {}
+    if os.path.isfile(user_cluster_path):
+        with open(user_cluster_path, "rt", encoding="utf-8", errors="replace") as f:
+            user_cluster = json.load(f) or {}
+        # user_cluster: {uid: cluster_id}
+        for _, cid in user_cluster.items():
+            cid_i = int(cid)
+            cluster_sizes[cid_i] = cluster_sizes.get(cid_i, 0) + 1
+
+    return {
+        "metrics": metrics,
+        "kinfo": kinfo,
+        "cluster_sizes": cluster_sizes,
+    }
 
 
 @app.get("/api/stats")
@@ -620,6 +965,61 @@ def api_train(
     thread = threading.Thread(
         target=_train_pipeline_job,
         args=(job_id, clusters, path),
+        daemon=True,
+    )
+    thread.start()
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.post("/api/cluster_text2vec")
+def api_cluster_text2vec(
+    input_file: str = Form(""),
+    k_min: int = Form(2),
+    k_max: int = Form(10),
+):
+    job_id = str(uuid.uuid4())
+    path = (input_file or "").strip() or WEIBO_CRAWL_LATEST_JSON
+    with jobs_lock:
+        jobs[job_id] = _new_job_record(job_id)
+    thread = threading.Thread(
+        target=_cluster_text2vec_job,
+        args=(job_id, path, k_min, k_max),
+        daemon=True,
+    )
+    thread.start()
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.post("/api/infer_text2vec")
+def api_infer_text2vec(
+    input_file: str = Form(""),
+):
+    job_id = str(uuid.uuid4())
+    path = (input_file or "").strip() or WEIBO_CRAWL_LATEST_JSON
+    with jobs_lock:
+        jobs[job_id] = _new_job_record(job_id)
+    thread = threading.Thread(
+        target=_infer_text2vec_job,
+        args=(job_id, path),
+        daemon=True,
+    )
+    thread.start()
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.post("/api/cluster_and_infer_text2vec")
+def api_cluster_and_infer_text2vec(
+    input_file: str = Form(""),
+    k_min: int = Form(2),
+    k_max: int = Form(10),
+):
+    job_id = str(uuid.uuid4())
+    path = (input_file or "").strip() or WEIBO_CRAWL_LATEST_JSON
+    with jobs_lock:
+        jobs[job_id] = _new_job_record(job_id)
+    thread = threading.Thread(
+        target=_cluster_and_infer_text2vec_job,
+        args=(job_id, path, k_min, k_max),
         daemon=True,
     )
     thread.start()
