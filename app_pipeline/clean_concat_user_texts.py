@@ -108,11 +108,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Clean concatenated per-user text jsonl.")
     parser.add_argument(
         "--input",
-        default=os.path.join("output", "user_text_concat_20260402224047.jsonl"),
+        default=os.path.join("output", "user_text_concat_merged.jsonl"),
+        help="由 concat_user_texts.py 生成；默认使用双数据集合并后的文件。",
     )
     parser.add_argument(
         "--output",
-        default=os.path.join("output", "cleaned_user_texts_20260402224047.jsonl"),
+        default=os.path.join("output", "cleaned_user_texts_merged.jsonl"),
     )
     parser.add_argument("--min-chars", type=int, default=200)
     parser.add_argument("--max-users", type=int, default=0)
