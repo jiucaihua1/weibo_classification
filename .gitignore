@@ -33,12 +33,12 @@ wheels/
 *.egg
 
 # ========== 项目生成的文件 ==========
-output/
 data/
 logs/
+output
+*.json
 *.log
 *.csv
-*.json
 *.pth
 *.pkl
 *.h5
