@@ -19,13 +19,23 @@ def rel_posix(project_dir: str, path: str) -> str:
         return path.replace("\\", "/")
 
 
-def load_hot_uids_csv(output_dir: str) -> tuple[str, int]:
-    path = os.path.join(output_dir, "hot_search_user_ids_latest.txt")
+def load_user_ids_txt(project_dir: str) -> tuple[str, int]:
+    """关键词多圈层流水线写入的 UID 池：input/user_ids.txt（每行一个 UID）。"""
+    path = os.path.join(project_dir, "input", "user_ids.txt")
     if not os.path.isfile(path):
         return "", 0
     with open(path, "rt", encoding="utf-8", errors="replace") as f:
         ids = [ln.strip() for ln in f if ln.strip()]
     return ",".join(ids), len(ids)
+
+
+def _latest_glob_file(parent_dir: str, pattern: str) -> str:
+    paths = glob.glob(os.path.join(parent_dir, pattern))
+    paths = [p for p in paths if os.path.isfile(p)]
+    if not paths:
+        return ""
+    paths.sort(key=os.path.getmtime, reverse=True)
+    return paths[0]
 
 
 def load_cookie_text(cookie_path: str, max_bytes: int = 512_000) -> str:
@@ -45,6 +55,28 @@ def file_probe(project_dir: str, abs_path: str) -> dict:
     }
 
 
+def resolve_prep_source_default(project_dir: str, output_dir: str, crawl_json_path: str) -> str:
+    """KMeans 步骤①「从原始数据导出」：优先 bundle，否则最新 unified（不用 kmeans 中间文件）。"""
+    if os.path.isfile(crawl_json_path):
+        return rel_posix(project_dir, crawl_json_path)
+    unified_paths = glob.glob(os.path.join(output_dir, "unified_*.jsonl"))
+    unified_paths.sort(key=os.path.getmtime, reverse=True)
+    if unified_paths:
+        return rel_posix(project_dir, unified_paths[0])
+    return rel_posix(project_dir, crawl_json_path)
+
+
+def resolve_train_input_default(project_dir: str, output_dir: str, crawl_json_path: str) -> str:
+    """
+    训练/推断输入：若已存在步骤①导出的 kmeans_tweets_input.jsonl 则优先；
+    否则与抓取结果一致（bundle 或最新 unified）。
+    """
+    kmeans_jsonl = os.path.join(output_dir, "kmeans_tweets_input.jsonl")
+    if os.path.isfile(kmeans_jsonl) and os.path.getsize(kmeans_jsonl) > 0:
+        return rel_posix(project_dir, kmeans_jsonl)
+    return resolve_prep_source_default(project_dir, output_dir, crawl_json_path)
+
+
 def get_workspace_state(
     project_dir: str,
     output_dir: str,
@@ -54,28 +86,32 @@ def get_workspace_state(
     *,
     fallback_demo_uid: str = "1087770692",
 ) -> dict:
-    hot_csv, hot_n = load_hot_uids_csv(output_dir)
+    pool_csv, pool_n = load_user_ids_txt(project_dir)
     cookie_full = load_cookie_text(cookie_path)
-    hot_abs = os.path.join(output_dir, "hot_search_user_ids_latest.txt")
-    train_rel = rel_posix(project_dir, crawl_json_path)
+    train_rel = resolve_train_input_default(project_dir, output_dir, crawl_json_path)
+    user_ids_abs = os.path.join(project_dir, "input", "user_ids.txt")
+    unified_latest_abs = _latest_glob_file(output_dir, "unified_*.jsonl")
+    aggregate_latest_abs = _latest_glob_file(output_dir, "user_aggregate_*.json")
 
-    cleaned_path = os.path.join(output_dir, "cleaned_user_texts.jsonl")
-    user_features_path = os.path.join(output_dir, "user_features_text2vec.npy")
-    user_ids_path = os.path.join(output_dir, "user_ids_text2vec.pkl")
+    kmeans_tweets_input_path = os.path.join(output_dir, "kmeans_tweets_input.jsonl")
+    prep_source_rel = resolve_prep_source_default(project_dir, output_dir, crawl_json_path)
     kmeans_multilabel_path = os.path.join(output_dir, "kmeans_multilabel_users.jsonl")
     kmeans_multilabel_meta_path = os.path.join(output_dir, "kmeans_multilabel_meta.json")
 
     return {
-        "default_user_id": hot_csv if hot_csv else fallback_demo_uid,
-        "hot_uid_count": hot_n,
-        "hot_uids_file": file_probe(project_dir, hot_abs),
+        "default_user_id": pool_csv if pool_csv else fallback_demo_uid,
+        "keyword_user_pool_count": pool_n,
+        "user_ids_pool_file": file_probe(project_dir, user_ids_abs),
+        "unified_latest_file": file_probe(project_dir, unified_latest_abs) if unified_latest_abs else file_probe(project_dir, os.path.join(output_dir, "unified_.jsonl")),
+        "user_aggregate_latest_file": file_probe(project_dir, aggregate_latest_abs)
+        if aggregate_latest_abs
+        else file_probe(project_dir, os.path.join(output_dir, "user_aggregate_.json")),
         "cookie_saved": bool(cookie_full),
         "cookie_char_len": len(cookie_full),
         "default_cookie": cookie_full,
         "crawl_bundle": file_probe(project_dir, crawl_json_path),
-        "cleaned_user_texts": file_probe(project_dir, cleaned_path),
-        "user_features_text2vec": file_probe(project_dir, user_features_path),
-        "user_ids_text2vec": file_probe(project_dir, user_ids_path),
+        "prep_source_default": prep_source_rel,
+        "kmeans_tweets_input": file_probe(project_dir, kmeans_tweets_input_path),
         "profiles_file": file_probe(project_dir, profile_path),
         "train_input_default": train_rel,
         "kmeans_multilabel": file_probe(project_dir, kmeans_multilabel_path),

@@ -56,21 +56,15 @@
               </a>
             </li>
             <li class="nav-item">
-              <a class="nav-link {% if nav_active == 'hot_search' %}active{% endif %}" href="/hot-search">
-                <span class="nav-link-icon d-md-none d-lg-inline-block"><i class="ti ti-flame"></i></span>
-                <span class="nav-link-title">热搜采样</span>
+              <a class="nav-link {% if nav_active == 'keyword_crawl' %}active{% endif %}" href="/keyword-crawl">
+                <span class="nav-link-icon d-md-none d-lg-inline-block"><i class="ti ti-key"></i></span>
+                <span class="nav-link-title">关键词抓取</span>
               </a>
             </li>
             <li class="nav-item">
               <a class="nav-link {% if nav_active == 'crawl' %}active{% endif %}" href="/crawl">
                 <span class="nav-link-icon d-md-none d-lg-inline-block"><i class="ti ti-download"></i></span>
                 <span class="nav-link-title">抓取微博</span>
-              </a>
-            </li>
-            <li class="nav-item">
-              <a class="nav-link {% if nav_active == 'clean' %}active{% endif %}" href="/clean">
-                <span class="nav-link-icon d-md-none d-lg-inline-block"><i class="ti ti-sparkles"></i></span>
-                <span class="nav-link-title">数据清洗</span>
               </a>
             </li>
             <li class="nav-item">
@@ -86,9 +80,10 @@
               </a>
             </li>
             <li class="nav-item">
-              <a class="nav-link {% if nav_active == 'multilabel' %}active{% endif %}" href="/kmeans-multilabel">
-                <span class="nav-link-icon d-md-none d-lg-inline-block"><i class="ti ti-tags"></i></span>
-                <span class="nav-link-title">KMeans 多标签</span>
+              <a class="nav-link {% if nav_active == 'personal_interest' %}active{% endif %}" href="/personal-interest">
+                <span class="nav-link-icon d-md-none d-lg-inline-block"><i class="ti ti-user-search"></i></span>
+                <span class="nav-link-title">个人兴趣预测</span>
+                <span class="badge bg-secondary-lt ms-1">占位</span>
               </a>
             </li>
           </ul>

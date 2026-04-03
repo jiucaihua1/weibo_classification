@@ -52,7 +52,10 @@ def write_crawl_bundle(output_dir: str, job_id: str, payload: dict[str, Any]) ->
 
 
 def cleanup_post_crawl_artifacts(output_dir: str) -> dict[str, int]:
-    """抓取合并完成后删除：unified_*.jsonl、user_aggregate_*.json、以及非 latest 的 weibo_crawl_*.json。"""
+    """
+    抓取合并完成后的清理：保留 unified_*.jsonl（便于溯源与「原始微博」等读取）；
+    仍删除 user_aggregate_*.json，以及非 latest 的 weibo_crawl_*.json。
+    """
     out = Path(output_dir)
     counts = {"unified": 0, "user_aggregate": 0, "weibo_crawl_extra": 0}
     if not out.is_dir():
@@ -62,10 +65,7 @@ def cleanup_post_crawl_artifacts(output_dir: str) -> dict[str, int]:
             continue
         name = p.name
         try:
-            if name.startswith("unified_") and name.endswith(".jsonl"):
-                p.unlink()
-                counts["unified"] += 1
-            elif name.startswith("user_aggregate_") and name.endswith(".json"):
+            if name.startswith("user_aggregate_") and name.endswith(".json"):
                 p.unlink()
                 counts["user_aggregate"] += 1
             elif name.startswith("weibo_crawl_") and name.endswith(".json") and name != "weibo_crawl_latest.json":

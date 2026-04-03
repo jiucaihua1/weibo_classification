@@ -39,6 +39,7 @@ deepseek_api_key.txt
 data/
 logs/
 output
+models
 *.json
 *.log
 *.csv

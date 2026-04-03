@@ -9,7 +9,15 @@ import numpy as np
 
 from app_pipeline.data_io import iter_crawl_bundle_users
 from app_pipeline.feature_bert_textrank import FeatureExtractionConfig, extract_user_features
+from app_pipeline.feature_tweet_embeddings import (
+    TweetEmbeddingConfig,
+    extract_tweet_embeddings,
+    mean_embedding_by_user,
+    static_features_for_users,
+)
 from app_pipeline.preprocess import clean_text
+from app_pipeline.train import INTEREST_LABELS
+from app_pipeline.train_tweet_topic import TweetMultilabelGBDT
 
 
 def _safe_int(x, default=0) -> int:
@@ -41,20 +49,246 @@ def _extract_evidence_rows(records: List[Dict], user_id: str, limit: int = 20) -
     return rows[:limit]
 
 
-def _is_verified_v(raw: Any) -> bool:
-    if not isinstance(raw, dict):
-        return False
-    user = raw.get("user")
-    if isinstance(user, dict):
-        return bool(user.get("verified") is True)
-    return bool(raw.get("verified") is True)
-
-
 def _text_is_retweet(text: str) -> bool:
     if not text:
         return False
     t = str(text).strip()
     return t == "转发微博" or t.startswith("转发微博")
+
+
+def _is_tweet_topic_pipeline(model_dir: str) -> bool:
+    p = os.path.join(model_dir, "training_pipeline.json")
+    if not os.path.isfile(p):
+        return False
+    try:
+        with open(p, "rt", encoding="utf-8", errors="replace") as f:
+            m = json.load(f)
+        return m.get("pipeline") == "tweet_topic_multilabel"
+    except Exception:
+        return False
+
+
+def _normalize_rows(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    return x / (np.linalg.norm(x, axis=1, keepdims=True) + eps)
+
+
+def _topic_interest_narratives(topic_mix: Dict[str, float]) -> List[str]:
+    """按话题占比生成可读叙事句，供前端展示。"""
+    items = [(lab, float(p)) for lab, p in topic_mix.items() if float(p) > 1e-9]
+    items.sort(key=lambda x: -x[1])
+    out: List[str] = []
+    for lab, p in items:
+        pct = int(round(p * 100))
+        if pct <= 0:
+            continue
+        if p >= 0.35:
+            level = "极高"
+        elif p >= 0.22:
+            level = "较高"
+        elif p >= 0.12:
+            level = "一定"
+        else:
+            level = "轻度"
+        out.append(f"该用户对 [{lab}] 表现出{level}关注（占比 {pct}%）")
+    return out
+
+
+def _primary_topic_from_mix(topic_mix: Dict[str, float]) -> str:
+    items = [(lab, float(p)) for lab, p in topic_mix.items() if float(p) > 1e-9]
+    if not items:
+        return ""
+    return max(items, key=lambda x: x[1])[0]
+
+
+def _load_cluster_llm_topic(model_dir: str) -> Dict[int, Dict[str, str]]:
+    """cluster_llm_topic.json -> {cluster_id: {label, persona, perception, summary}}"""
+    p = os.path.join(model_dir, "cluster_llm_topic.json")
+    if not os.path.isfile(p):
+        return {}
+    try:
+        with open(p, "rt", encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    clusters = data.get("clusters") if isinstance(data, dict) else None
+    if not isinstance(clusters, dict):
+        return {}
+    out: Dict[int, Dict[str, str]] = {}
+    for k, v in clusters.items():
+        try:
+            ki = int(k)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(v, dict):
+            out[ki] = {
+                "label": str(v.get("label", "") or ""),
+                "persona": str(v.get("persona", "") or ""),
+                "perception": str(v.get("perception", "") or ""),
+                "summary": str(v.get("summary", "") or ""),
+            }
+    return out
+
+
+def infer_tweet_topic_multilabel(
+    unified_path: str,
+    model_dir: str,
+    output_file: str,
+) -> List[Dict]:
+    """
+    单条微博向量流水线：加载 tweet KMeans + GBDT，按用户均值向量（+静态特征）预测多标签；
+    同时给出基于微博条目的「话题占比」作解释。
+    """
+    with open(os.path.join(model_dir, "training_pipeline.json"), "rt", encoding="utf-8", errors="replace") as f:
+        meta = json.load(f)
+    with open(os.path.join(model_dir, "cluster_label_map.json"), "rt", encoding="utf-8", errors="replace") as f:
+        cluster_map = {int(k): v for k, v in json.load(f).items()}
+    with open(os.path.join(model_dir, "kmeans_tweet_model.pkl"), "rb") as f:
+        km = pickle.load(f)
+    tweet_pca_path = os.path.join(model_dir, "tweet_pca_64.pkl")
+    tweet_pca = None
+    if os.path.isfile(tweet_pca_path):
+        try:
+            with open(tweet_pca_path, "rb") as f:
+                tweet_pca = pickle.load(f)
+        except Exception:
+            tweet_pca = None
+    with open(os.path.join(model_dir, "gbdt_multilabel.pkl"), "rb") as f:
+        gbdt_raw = pickle.load(f)
+        if isinstance(gbdt_raw, dict) and gbdt_raw.get("_gbdt_artifact_version") == 1:
+            clf = TweetMultilabelGBDT(gbdt_raw["estimators"], gbdt_raw["constants"])
+        else:
+            clf = gbdt_raw
+
+    interest_labels = list(meta.get("interest_labels") or INTEREST_LABELS)
+    noise_cids = set()
+    for x in meta.get("noise_cluster_ids") or []:
+        try:
+            noise_cids.add(int(x))
+        except (TypeError, ValueError):
+            pass
+    with_static = bool(meta.get("with_static_features", True))
+    model_name = str(meta.get("model_name", "shibing624/text2vec-base-chinese"))
+    device = str(meta.get("device", "cuda"))
+    min_tweet_chars = int(meta.get("min_tweet_chars", 5))
+
+    cfg = TweetEmbeddingConfig(
+        min_tweet_chars=min_tweet_chars,
+        encode_batch_size=64,
+        device=device,
+        model_name=model_name,
+    )
+    print("[INFER] tweet-topic: encoding per-tweet vectors …", flush=True)
+    tweet_user_ids, x_tweets, tweet_texts = extract_tweet_embeddings(unified_path, cfg=cfg)
+    users_order, x_mean = mean_embedding_by_user(tweet_user_ids, x_tweets)
+    if with_static:
+        static_mat, _ = static_features_for_users(unified_path, users_order)
+        x_in = np.concatenate([x_mean, static_mat], axis=1).astype(np.float32, copy=False)
+    else:
+        x_in = x_mean
+
+    prob_list = (
+        clf.predict_proba_per_label(x_in)
+        if hasattr(clf, "predict_proba_per_label")
+        else clf.predict_proba(x_in)
+    )
+    y_hat = clf.predict(x_in)
+
+    x768 = x_tweets.astype(np.float32, copy=False)
+    if tweet_pca is not None:
+        # Strict order must match training:
+        #   768 -> PCA(64) -> L2 normalize -> KMeans
+        x64 = tweet_pca.transform(x768).astype(np.float32, copy=False)
+        x_kmeans_input = _normalize_rows(x64)
+    else:
+        # Backward compatibility for old artifacts.
+        x_kmeans_input = _normalize_rows(x768)
+
+    tweet_cids = km.predict(x_kmeans_input)
+
+    topic_llm_by_c = _load_cluster_llm_topic(model_dir)
+
+    _skip_label = {"Noise", "日常杂谈"}
+    topic_label_universe = sorted({v for v in cluster_map.values() if v not in _skip_label})
+    profiles: List[Dict] = []
+    n_users = len(users_order)
+    print(f"[INFER] total_feature_users={n_users}", flush=True)
+
+    uid_to_indices: Dict[str, List[int]] = defaultdict(list)
+    for i, u in enumerate(tweet_user_ids):
+        uid_to_indices[str(u).strip()].append(i)
+
+    for ui, uid in enumerate(users_order):
+        idxs = uid_to_indices[uid]
+        n_t = max(1, len(idxs))
+        label_counts = Counter()
+        n_eff = 0
+        for j in idxs:
+            cid = int(tweet_cids[j])
+            if cid in noise_cids:
+                continue
+            lab = cluster_map.get(cid, "其他")
+            if lab in _skip_label:
+                continue
+            n_eff += 1
+            label_counts[lab] += 1
+        if n_eff <= 0:
+            topic_mix = {lab: 0.0 for lab in topic_label_universe}
+        else:
+            topic_mix = {lab: label_counts.get(lab, 0) / float(n_eff) for lab in topic_label_universe}
+        narratives = _topic_interest_narratives(topic_mix)
+        primary_topic = _primary_topic_from_mix(topic_mix)
+
+        scores_gbdt: Dict[str, float] = {}
+        for j, lab in enumerate(interest_labels):
+            arr = prob_list[j]
+            # positive class column 1
+            scores_gbdt[lab] = float(arr[ui, 1]) if arr.shape[1] > 1 else float(arr[ui, 0])
+
+        active = [interest_labels[j] for j in range(len(interest_labels)) if int(y_hat[ui, j]) == 1]
+        top_s = sorted(scores_gbdt.items(), key=lambda x: x[1], reverse=True)
+        gbdt_top = "、".join(active) if active else (top_s[0][0] if top_s else "—")
+        top_interest = primary_topic if primary_topic else gbdt_top
+
+        evidence: List[Dict[str, Any]] = []
+        for j in idxs[:20]:
+            cj = int(tweet_cids[j])
+            tl = cluster_map.get(cj, "其他")
+            tmeta = topic_llm_by_c.get(cj) or {}
+            raw = tweet_texts[j] if j < len(tweet_texts) else ""
+            snippet = raw if len(raw) <= 160 else raw[:160] + "…"
+            evidence.append(
+                {
+                    "topic_hint": tl,
+                    "topic_summary": tmeta.get("summary", ""),
+                    "topic_persona": tmeta.get("persona", ""),
+                    "topic_perception": tmeta.get("perception", ""),
+                    "text": snippet,
+                }
+            )
+
+        profiles.append(
+            {
+                "user_id": uid,
+                "top_interest": top_interest,
+                "cluster_id": None,
+                "interest_scores": scores_gbdt,
+                "topic_mix_from_kmeans": topic_mix,
+                "topic_interest_narratives": narratives,
+                "gbdt_top_interest": gbdt_top,
+                "gbdt_positive_labels": active,
+                "source_stats": {"tweet": n_t},
+                "sample_size": n_t,
+                "evidence": evidence,
+            }
+        )
+        if (ui + 1) % 20 == 0:
+            print(f"[INFER] profiles={ui + 1}/{n_users}", flush=True)
+
+    profiles.sort(key=lambda x: x["sample_size"], reverse=True)
+    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
+    with open(output_file, "wt", encoding="utf-8") as f:
+        json.dump(profiles, f, ensure_ascii=False, indent=2)
+    return profiles
 
 
 def infer(
@@ -64,7 +298,11 @@ def infer(
 ) -> List[Dict]:
     """
     覆盖替换：用 TextRank + text2vec 用户向量 做 KMeans 聚类并输出兴趣画像。
+    若 training_pipeline.json 标明 tweet_topic_multilabel，则走单条微博话题流水线。
     """
+    if _is_tweet_topic_pipeline(model_dir):
+        return infer_tweet_topic_multilabel(unified_path, model_dir, output_file)
+
     with open(os.path.join(model_dir, "kmeans_model.pkl"), "rb") as f:
         km = pickle.load(f)
     with open(os.path.join(model_dir, "cluster_label_map.json"), "rt", encoding="utf-8") as f:
@@ -172,15 +410,11 @@ def infer(
         texts: List[str] = []
         source_stats: Counter = Counter()
         evidence: List[Dict[str, Any]] = []
-        verified = False
 
         for rec in records:
             if not isinstance(rec, dict):
                 continue
             raw = rec.get("raw") or {}
-            if _is_verified_v(raw):
-                verified = True
-                break
             if rec.get("source_type") != "tweet":
                 continue
             text = rec.get("text") or ""
@@ -201,7 +435,7 @@ def infer(
                 }
             )
 
-        if verified or not texts:
+        if not texts:
             continue
 
         evidence.sort(key=lambda r: _safe_int(r.get("item_id") or 0, 0), reverse=True)

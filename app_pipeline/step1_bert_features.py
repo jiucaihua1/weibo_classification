@@ -1,11 +1,8 @@
 """
 app_pipeline/step1_bert_features.py
 
-把「TextRank 关键词抽取 + BERT(text2vec) 向量化 + Mean Pooling + 持久化」合成一个单文件脚本。
-
-重要：此版本不做“数据清洗/过滤逻辑”。它直接读取你已有的：
-`output/cleaned_user_texts.jsonl`（由 `app_pipeline/clean_user_text.py` 产出），
-只在 cleaned_text 上做 TextRank -> text2vec -> mean pooling -> 保存用户向量。
+命令行工具：从 cleaned_user_texts.jsonl 生成用户级 TextRank + text2vec 向量（.npy / .pkl）。
+Web「数据清洗」任务不再调用本模块；主聚类流水线为 train_tweet_topic（单条微博向量）。
 """
 
 from __future__ import annotations

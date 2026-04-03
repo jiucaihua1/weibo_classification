@@ -3,11 +3,12 @@
 {% block page_pretitle %}结果{% endblock %}
 {% block page_title %}用户画像{% endblock %}
 {% block page_sub %}
-<div class="text-secondary mt-1">优先 <code>{{ workspace.profiles_file.path }}</code>；若该文件暂无数据，则列表来自 <code>kmeans_multilabel_users.jsonl</code>（来源列会标注「仅多标签」）。主簇 / 次簇为多标签结果。</div>
+<div class="text-secondary mt-1">
+  数据来自 <code>{{ workspace.profiles_file.path }}</code>（由「训练 / 画像」推断生成）。若文件为空，列表可能为空。
+</div>
 {% endblock %}
 
 {% block content %}
-{% set cdn = cluster_display_names or {} %}
 <div class="row row-cards">
   <div class="col-12">
     <div class="card">
@@ -23,9 +24,8 @@
           <thead>
             <tr>
               <th>用户</th>
-              <th>主簇</th>
-              <th>次簇（跨界）</th>
-              <th>标签 Top1</th>
+              <th>主话题 / 粗分</th>
+              <th>话题关注叙事</th>
               <th>样本数</th>
               <th>来源</th>
               <th class="w-1"></th>
@@ -34,38 +34,28 @@
           <tbody>
             {% for p in profiles %}
               {% set u = user_infos.get(p.user_id, {}) %}
-              {% set ml = p.kmeans_ml %}
               <tr>
                 <td>
                   <div class="fw-semibold">{{ u.nick_name or p.user_id }}</div>
                   <div class="uid-sub">{{ p.user_id }}{% if u.followers_count is not none %} · 粉丝 {{ u.followers_count }}{% endif %}</div>
                 </td>
                 <td>
-                  {% if ml %}
-                    {% set pk = ml.primary|string %}
-                    {% set pn = cdn.get(pk, '') %}
-                    <div><span class="badge bg-blue-lt"{% if pn %} title="簇 {{ ml.primary }}"{% elif cluster_keyword_summaries.get(pk) %} title="{{ cluster_keyword_summaries.get(pk)|e }}"{% endif %}>{% if pn %}{{ pn }}{% else %}簇 {{ ml.primary }}{% endif %}</span></div>
-                    {% if cluster_keyword_summaries.get(pk) %}
-                      <div class="small text-secondary mt-1 text-break">{{ cluster_keyword_summaries.get(pk) }}</div>
-                    {% endif %}
+                  <span class="badge bg-secondary-lt">{{ p.top_interest }}</span>
+                  {% if p.gbdt_top_interest %}
+                    <div class="small text-secondary mt-1">粗分：{{ p.gbdt_top_interest }}</div>
+                  {% endif %}
+                </td>
+                <td class="small" style="max-width: 26rem;">
+                  {% if p.topic_interest_narratives %}
+                    <ul class="mb-0 ps-3 text-break">
+                      {% for line in p.topic_interest_narratives[:4] %}
+                        <li>{{ line }}</li>
+                      {% endfor %}
+                    </ul>
                   {% else %}
                     <span class="text-secondary">—</span>
                   {% endif %}
                 </td>
-                <td>
-                  {% if ml and ml.secondary %}
-                    {% for c in ml.secondary %}
-                      {% set sk = c|string %}
-                      {% set sn = cdn.get(sk, '') %}
-                      <span class="badge bg-azure-lt me-1" title="簇 {{ c }}{% if cluster_keyword_summaries.get(sk) %} · {{ cluster_keyword_summaries.get(sk)|e }}{% endif %}">{% if sn %}{{ sn }}{% else %}簇 {{ c }}{% endif %}</span>
-                    {% endfor %}
-                  {% elif ml %}
-                    <span class="text-secondary">—</span>
-                  {% else %}
-                    <span class="text-secondary">—</span>
-                  {% endif %}
-                </td>
-                <td><span class="badge bg-secondary-lt">{{ p.top_interest }}</span></td>
                 <td>{{ p.sample_size }}</td>
                 <td class="text-secondary small">{{ p.source_stats }}</td>
                 <td><a href="/users/{{ p.user_id }}" class="btn btn-sm btn-outline-primary">详情</a></td>

@@ -15,6 +15,21 @@ def load_unified_jsonl_records(path: str) -> List[Dict[str, Any]]:
     return records
 
 
+def iter_unified_jsonl_records(path: str) -> Iterator[Dict[str, Any]]:
+    """Stream unified jsonl lines (one JSON object per line)."""
+    with open(path, "rt", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict):
+                yield data
+
+
 def load_crawl_bundle_records(path: str) -> List[Dict[str, Any]]:
     with open(path, "rt", encoding="utf-8") as f:
         data = json.load(f)

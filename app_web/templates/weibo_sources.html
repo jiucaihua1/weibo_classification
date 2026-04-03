@@ -4,8 +4,8 @@
 {% block page_title %}{{ user_info.nick_name or user_id }}{% endblock %}
 {% block page_sub %}
 <div class="text-secondary mt-1">
-  以下为本地 <code>output/unified_*.jsonl</code> 中该用户的抓取记录（去重后按时间倒序，最多展示 800 条）。
-  {% if latest_unified_rel %}最近扫描的 unified 文件：<code>{{ latest_unified_rel }}</code>。{% endif %}
+  聚合本地 <code>output/unified_*.jsonl</code> 与合并后的 <code>weibo_crawl_latest.json</code>（去重、按时间倒序，最多 800 条）；正文优先取爬虫 <code>raw.content</code>。
+  {% if latest_unified_rel %}若仍有 unified：<code>{{ latest_unified_rel }}</code>。{% endif %}
 </div>
 {% endblock %}
 
@@ -20,7 +20,6 @@
           <span class="text-secondary small">命中文件：{% for fn in weibo_source_files %}<code class="me-1">{{ fn }}</code>{% endfor %}</span>
         {% endif %}
         <div class="ms-auto btn-list">
-          <a href="/kmeans-multilabel" class="btn btn-sm btn-outline-secondary">返回多标签</a>
           <a href="/profiles" class="btn btn-sm btn-outline-secondary">画像表</a>
           <a href="/users/{{ user_id }}" class="btn btn-sm btn-outline-primary">用户画像详情</a>
         </div>
@@ -51,7 +50,7 @@
           </div>
         {% else %}
           <div class="text-secondary">
-            未在 <code>unified_*.jsonl</code> 中找到该用户的微博。请先完成「抓取微博」或确认 UID 与抓取结果一致。
+            未在 <code>unified_*.jsonl</code> 或 <code>weibo_crawl_latest.json</code> 中找到该用户微博。请先完成抓取合并或确认 UID 一致。
           </div>
         {% endif %}
       </div>

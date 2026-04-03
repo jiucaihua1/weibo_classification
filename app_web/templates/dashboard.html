@@ -1,10 +1,10 @@
 {% extends "layout.html" %}
 {% block title %}总览 · 微博兴趣看板{% endblock %}
 {% block page_pretitle %}本地优先{% endblock %}
-{% block page_title %}Dashboard{% endblock %}
+{% block page_title %}总览{% endblock %}
 {% block page_sub %}
 <div class="text-secondary mt-1">
-  重启后会自动读取 <code>output/</code> 与 <code>weibospider/cookie.txt</code>：热搜 UID、已抓取 JSON、Cookie。流程在左侧分步进入各页面。
+  <strong>当前主流程（终端）：</strong><code>multidim_crawl.py</code> — <strong>关键词召回</strong>（<code>tweet_by_keyword</code> → <code>output/unified_*.jsonl</code>）→ 抽样写入 <code>input/user_ids.txt</code> → <strong>用户资料</strong>（<code>user</code>）→ <strong>历史推文</strong>（<code>tweet_by_user_id</code>）。也可在「抓取微博」页仅按 UID 补拉时间线并生成 bundle。
 </div>
 {% endblock %}
 
@@ -21,39 +21,27 @@
   <div class="col-sm-6 col-lg-3">
     <div class="card">
       <div class="card-body">
-        <div class="subheader">类别数（Top1）</div>
+        <div class="subheader">主话题种类数</div>
         <div class="h1 mb-0">{{ interest_distribution|length }}</div>
-      </div>
-    </div>
-  </div>
-  <div class="col-sm-6 col-lg-3">
-    <div class="card">
-      <div class="card-body d-flex flex-column">
-        <div class="subheader">KMeans 多标签</div>
-        <div class="h1 mb-0">{{ kmeans_multilabel_count }}</div>
-        <div class="text-secondary small mt-1">
-          <a href="/kmeans-multilabel">查看表格</a>
-          {% if workspace.kmeans_multilabel.exists %}<span class="text-success">· 已有文件</span>{% endif %}
-        </div>
+        <div class="text-secondary small mt-1">推断结果 Top1 统计</div>
       </div>
     </div>
   </div>
   <div class="col-sm-6 col-lg-3">
     <div class="card">
       <div class="card-body">
-        <div class="subheader">热搜 UID 文件</div>
-        <div class="h1 mb-0">{{ workspace.hot_uid_count }}</div>
-        <div class="text-secondary small">个（<code>{{ workspace.hot_uids_file.path }}</code>）</div>
+        <div class="subheader">关键词用户池</div>
+        <div class="h1 mb-0">{{ workspace.keyword_user_pool_count }}</div>
+        <div class="text-secondary small mt-1">行数 · <code class="small">{{ workspace.user_ids_pool_file.path }}</code></div>
       </div>
     </div>
   </div>
   <div class="col-sm-6 col-lg-3">
     <div class="card">
       <div class="card-body d-flex flex-column">
-        <div class="subheader">本地 output</div>
-        <div class="h1 mb-0">{% if workspace.crawl_bundle.exists %}已抓取{% else %}待抓取{% endif %}</div>
-        <div class="text-secondary small">训练默认读 <code>{{ workspace.train_input_default }}</code></div>
-        <div class="text-secondary small mt-2">清理见下方「按步骤删除」。</div>
+        <div class="subheader">统一数据流 / Bundle</div>
+        <div class="h1 mb-0">{% if workspace.unified_latest_file.exists or workspace.crawl_bundle.exists %}有数据{% else %}无{% endif %}</div>
+        <div class="text-secondary small mt-1">最新 <code class="small">{{ workspace.unified_latest_file.path }}</code>；训练默认 <code class="small">{{ workspace.train_input_default }}</code></div>
       </div>
     </div>
   </div>
@@ -62,43 +50,43 @@
 <div class="row row-cards mb-4" id="cleanup-panel">
   <div class="col-12">
     <div class="card">
-      <div class="card-header"><h3 class="card-title mb-0">清理 output（按步骤勾选）</h3></div>
+      <div class="card-header"><h3 class="card-title mb-0">清理本地产物（按步骤勾选）</h3></div>
       <div class="card-body">
         <div class="row g-3">
           <div class="col-md-6">
             <label class="form-check">
-              <input type="checkbox" class="form-check-input" id="cl-hot">
-              <span class="form-check-label">① 热搜采样：<code>hot_search_user_ids_latest.txt</code>、<code>hot_search_debug_*.json</code>、<code>hot_search_keyword_user_summary_*.json</code></span>
-            </label>
-          </div>
-          <div class="col-md-6">
-            <label class="form-check">
               <input type="checkbox" class="form-check-input" id="cl-mid">
-              <span class="form-check-label">② 抓取中间件：<code>unified_*.jsonl</code>、<code>user_aggregate_*.json</code></span>
+              <span class="form-check-label">① 抓取中间件：<code>unified_*.jsonl</code>、<code>user_aggregate_*.json</code></span>
             </label>
           </div>
           <div class="col-md-6">
             <label class="form-check">
               <input type="checkbox" class="form-check-input" id="cl-bundle">
-              <span class="form-check-label">③ 抓取结果：<code>weibo_crawl_latest.json</code> 及所有 <code>weibo_crawl_*.json</code></span>
+              <span class="form-check-label">② 合并 bundle：<code>weibo_crawl_*.json</code></span>
             </label>
           </div>
           <div class="col-md-6">
             <label class="form-check">
               <input type="checkbox" class="form-check-input" id="cl-uinfo">
-              <span class="form-check-label">④ 用户资料缓存：<code>user_infos.json</code></span>
+              <span class="form-check-label">③ 用户资料缓存：<code>user_infos.json</code></span>
             </label>
           </div>
           <div class="col-md-6">
             <label class="form-check">
               <input type="checkbox" class="form-check-input" id="cl-prof">
-              <span class="form-check-label">⑤ 画像结果：<code>user_interest_profiles.json</code></span>
+              <span class="form-check-label">④ 画像结果：<code>user_interest_profiles.json</code></span>
             </label>
           </div>
           <div class="col-md-6">
             <label class="form-check">
               <input type="checkbox" class="form-check-input" id="cl-ml">
-              <span class="form-check-label text-danger">⑥ 模型目录：<code>output/ml_artifacts</code>（需重新训练）</span>
+              <span class="form-check-label text-danger">⑤ 模型目录：<code>output/ml_artifacts</code>（需重新训练）</span>
+            </label>
+          </div>
+          <div class="col-md-6">
+            <label class="form-check">
+              <input type="checkbox" class="form-check-input" id="cl-input-uids">
+              <span class="form-check-label">⑥ 关键词用户池：<code>input/user_ids.txt</code></span>
             </label>
           </div>
         </div>
@@ -119,13 +107,14 @@
 <div class="row row-cards mb-4">
   <div class="col-12">
     <div class="card">
-      <div class="card-header"><h3 class="card-title mb-0">本地数据状态</h3></div>
+      <div class="card-header"><h3 class="card-title mb-0">本地数据与配置</h3></div>
       <div class="card-body p-0">
         <div class="table-responsive">
           <table class="table table-vcenter mb-0">
             <thead>
               <tr>
-                <th>文件</th>
+                <th>说明</th>
+                <th>路径</th>
                 <th>状态</th>
                 <th>大小</th>
                 <th>修改时间</th>
@@ -133,24 +122,42 @@
             </thead>
             <tbody>
               <tr>
-                <td class="font-monospace small">{{ workspace.hot_uids_file.path }}</td>
-                <td>{% if workspace.hot_uids_file.exists %}<span class="badge bg-green-lt">存在</span>{% else %}<span class="badge bg-secondary-lt">无</span>{% endif %}</td>
-                <td class="small">{% if workspace.hot_uids_file.exists %}{{ workspace.hot_uids_file.size_bytes }} B{% else %}—{% endif %}</td>
-                <td class="small text-secondary">{{ workspace.hot_uids_file.mtime_iso or "—" }}</td>
+                <td>关键词用户池</td>
+                <td class="font-monospace small">{{ workspace.user_ids_pool_file.path }}</td>
+                <td>{% if workspace.user_ids_pool_file.exists %}<span class="badge bg-green-lt">存在</span>{% else %}<span class="badge bg-secondary-lt">无</span>{% endif %}</td>
+                <td class="small">{% if workspace.user_ids_pool_file.exists %}{{ workspace.user_ids_pool_file.size_bytes }} B{% else %}—{% endif %}</td>
+                <td class="small text-secondary">{{ workspace.user_ids_pool_file.mtime_iso or "—" }}</td>
               </tr>
               <tr>
+                <td>最新 unified 流</td>
+                <td class="font-monospace small">{{ workspace.unified_latest_file.path }}</td>
+                <td>{% if workspace.unified_latest_file.exists %}<span class="badge bg-green-lt">存在</span>{% else %}<span class="badge bg-secondary-lt">无</span>{% endif %}</td>
+                <td class="small">{% if workspace.unified_latest_file.exists %}{{ workspace.unified_latest_file.size_bytes }} B{% else %}—{% endif %}</td>
+                <td class="small text-secondary">{{ workspace.unified_latest_file.mtime_iso or "—" }}</td>
+              </tr>
+              <tr>
+                <td>最新 user 聚合</td>
+                <td class="font-monospace small">{{ workspace.user_aggregate_latest_file.path }}</td>
+                <td>{% if workspace.user_aggregate_latest_file.exists %}<span class="badge bg-green-lt">存在</span>{% else %}<span class="badge bg-secondary-lt">无</span>{% endif %}</td>
+                <td class="small">{% if workspace.user_aggregate_latest_file.exists %}{{ workspace.user_aggregate_latest_file.size_bytes }} B{% else %}—{% endif %}</td>
+                <td class="small text-secondary">{{ workspace.user_aggregate_latest_file.mtime_iso or "—" }}</td>
+              </tr>
+              <tr>
+                <td>合并 bundle</td>
                 <td class="font-monospace small">{{ workspace.crawl_bundle.path }}</td>
-                <td>{% if workspace.crawl_bundle.exists %}<span class="badge bg-green-lt">存在</span>{% else %}<span class="badge bg-orange-lt">需先抓取</span>{% endif %}</td>
+                <td>{% if workspace.crawl_bundle.exists %}<span class="badge bg-green-lt">存在</span>{% else %}<span class="badge bg-orange-lt">无</span>{% endif %}</td>
                 <td class="small">{% if workspace.crawl_bundle.exists %}{{ workspace.crawl_bundle.size_bytes }} B{% else %}—{% endif %}</td>
                 <td class="small text-secondary">{{ workspace.crawl_bundle.mtime_iso or "—" }}</td>
               </tr>
               <tr>
+                <td>画像</td>
                 <td class="font-monospace small">{{ workspace.profiles_file.path }}</td>
                 <td>{% if workspace.profiles_file.exists %}<span class="badge bg-green-lt">存在</span>{% else %}<span class="badge bg-secondary-lt">无</span>{% endif %}</td>
                 <td class="small">{% if workspace.profiles_file.exists %}{{ workspace.profiles_file.size_bytes }} B{% else %}—{% endif %}</td>
                 <td class="small text-secondary">{{ workspace.profiles_file.mtime_iso or "—" }}</td>
               </tr>
               <tr>
+                <td>Cookie</td>
                 <td class="font-monospace small">weibospider/cookie.txt</td>
                 <td>{% if workspace.cookie_saved %}<span class="badge bg-green-lt">已保存</span>{% else %}<span class="badge bg-orange-lt">未填写</span>{% endif %}</td>
                 <td class="small">{% if workspace.cookie_saved %}{{ workspace.cookie_char_len }} 字符{% else %}—{% endif %}</td>
@@ -161,7 +168,7 @@
         </div>
       </div>
       <div class="card-body border-top text-secondary small">
-        抓取页默认用户 ID 来自 <code>{{ workspace.hot_uids_file.path }}</code>（每行一个 UID，页面里用逗号展示）。训练页默认输入为当前目录下的抓取 JSON。
+        训练与推断使用的聚类模型、向量与标签等均在 <code>output/ml_artifacts/</code>（由「训练 / 画像」生成），与抓取数据相互独立。
       </div>
     </div>
   </div>
@@ -169,11 +176,11 @@
 
 <div class="row g-3 mb-4">
   <div class="col-md-6 col-lg-4">
-    <a href="/hot-search" class="text-decoration-none text-reset">
+    <a href="/keyword-crawl" class="text-decoration-none text-reset">
       <div class="card card-hover h-100">
         <div class="card-body">
-          <div class="d-flex align-items-center gap-2 mb-2"><i class="ti ti-flame text-primary"></i><span class="fw-semibold">热搜采样</span></div>
-          <div class="text-secondary small">从热搜评论者抽取 UID，写入本地列表。</div>
+          <div class="d-flex align-items-center gap-2 mb-2"><i class="ti ti-key text-primary"></i><span class="fw-semibold">关键词抓取</span></div>
+          <div class="text-secondary small">终端命令说明与本地产物路径。</div>
         </div>
       </div>
     </a>
@@ -183,17 +190,7 @@
       <div class="card card-hover h-100">
         <div class="card-body">
           <div class="d-flex align-items-center gap-2 mb-2"><i class="ti ti-download text-primary"></i><span class="fw-semibold">抓取微博</span></div>
-          <div class="text-secondary small">按 UID 生成 <code>weibo_crawl_latest.json</code>。</div>
-        </div>
-      </div>
-    </a>
-  </div>
-  <div class="col-md-6 col-lg-4">
-    <a href="/clean" class="text-decoration-none text-reset">
-      <div class="card card-hover h-100">
-        <div class="card-body">
-          <div class="d-flex align-items-center gap-2 mb-2"><i class="ti ti-sparkles text-primary"></i><span class="fw-semibold">数据清洗</span></div>
-          <div class="text-secondary small">输出 <code>cleaned_user_texts.jsonl</code>（供后续聚类/分类）。</div>
+          <div class="text-secondary small">按 UID 拉时间线，生成 <code>weibo_crawl_*.json</code>。</div>
         </div>
       </div>
     </a>
@@ -203,7 +200,17 @@
       <div class="card card-hover h-100">
         <div class="card-body">
           <div class="d-flex align-items-center gap-2 mb-2"><i class="ti ti-brain text-primary"></i><span class="fw-semibold">训练 / 画像</span></div>
-          <div class="text-secondary small">读取本地 JSON 聚类并写回画像文件。</div>
+          <div class="text-secondary small">KMeans：① 导出清洗 jsonl → ② 聚类选 k → ③ 画像；含一键与 AI 命名。</div>
+        </div>
+      </div>
+    </a>
+  </div>
+  <div class="col-md-6 col-lg-4">
+    <a href="/personal-interest" class="text-decoration-none text-reset">
+      <div class="card card-hover h-100 border-secondary border-opacity-25">
+        <div class="card-body">
+          <div class="d-flex align-items-center gap-2 mb-2"><i class="ti ti-user-search text-secondary"></i><span class="fw-semibold text-secondary">个人兴趣预测</span> <span class="badge bg-secondary-lt">即将上线</span></div>
+          <div class="text-secondary small">单用户抓取 + 模型推断（占位）。</div>
         </div>
       </div>
     </a>
@@ -214,7 +221,7 @@
   <div class="col-12">
     <div class="card">
       <div class="card-header d-flex flex-wrap align-items-center gap-2">
-        <h3 class="card-title mb-0">类别占比</h3>
+        <h3 class="card-title mb-0">主话题分布</h3>
         <a href="/profiles" class="btn btn-sm btn-outline-primary ms-auto">打开画像表</a>
       </div>
       <div class="card-body">
@@ -225,7 +232,7 @@
             {% endfor %}
           </div>
         {% else %}
-          <div class="text-secondary">暂无训练结果。</div>
+          <div class="text-secondary">暂无推断结果。</div>
         {% endif %}
       </div>
     </div>
@@ -254,12 +261,12 @@
   document.getElementById("cleanup-selective").addEventListener("click", async () => {
     const fd = new FormData();
     fd.append("mode", "selective");
-    fd.append("del_hot_search", document.getElementById("cl-hot").checked ? "1" : "0");
     fd.append("del_crawl_intermediate", document.getElementById("cl-mid").checked ? "1" : "0");
     fd.append("del_crawl_bundle", document.getElementById("cl-bundle").checked ? "1" : "0");
     fd.append("del_user_infos", document.getElementById("cl-uinfo").checked ? "1" : "0");
     fd.append("del_profiles", document.getElementById("cl-prof").checked ? "1" : "0");
     fd.append("del_ml_artifacts", document.getElementById("cl-ml").checked ? "1" : "0");
+    fd.append("del_input_user_ids", document.getElementById("cl-input-uids").checked ? "1" : "0");
     if (!confirm("确定删除已勾选的文件？此操作不可恢复。")) return;
     await postCleanup(fd);
   });

@@ -46,12 +46,13 @@ def cleanup_output_full(output_dir: str, *, keep_ml_artifacts: bool = True) -> d
 def cleanup_output_selective(
     output_dir: str,
     *,
-    del_hot_search: bool = False,
+    project_dir: str = "",
     del_crawl_intermediate: bool = False,
     del_crawl_bundle: bool = False,
     del_user_infos: bool = False,
     del_profiles: bool = False,
     del_ml_artifacts: bool = False,
+    del_input_user_ids: bool = False,
 ) -> dict[str, Any]:
     breakdown: dict[str, int] = {}
     removed_files, removed_dirs = 0, 0
@@ -70,22 +71,9 @@ def cleanup_output_selective(
                 return False
         return False
 
-    if del_hot_search:
-        n = 0
-        for name in os.listdir(output_dir):
-            path = os.path.join(output_dir, name)
-            if not os.path.isfile(path):
-                continue
-            if name == "hot_search_user_ids_latest.txt":
-                if rm_file(path):
-                    n += 1
-            elif name.startswith("hot_search_debug_") and name.endswith(".json"):
-                if rm_file(path):
-                    n += 1
-            elif name.startswith("hot_search_keyword_user_summary_") and name.endswith(".json"):
-                if rm_file(path):
-                    n += 1
-        breakdown["hot_search"] = n
+    if del_input_user_ids and project_dir:
+        uid_path = os.path.join(project_dir, "input", "user_ids.txt")
+        breakdown["input_user_ids"] = 1 if rm_file(uid_path) else 0
 
     if del_crawl_intermediate:
         n = 0

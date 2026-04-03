@@ -4,7 +4,7 @@
 {% block page_title %}抓取微博{% endblock %}
 {% block page_sub %}
 <div class="text-secondary mt-1">
-  用户 ID 默认来自本地 <code>{{ workspace.hot_uids_file.path }}</code>；Cookie 默认来自 <code>weibospider/cookie.txt</code>。可直接修改后再抓取。
+  用户 ID 默认来自 <code>{{ workspace.user_ids_pool_file.path }}</code>（<code>multidim_crawl.py</code> 写入）；若为空则使用下方演示 UID。Cookie 默认 <code>weibospider/cookie.txt</code>。
 </div>
 {% endblock %}
 

@@ -1,0 +1,30 @@
+{% extends "layout.html" %}
+{% block title %}个人兴趣预测 · 微博兴趣看板{% endblock %}
+{% block page_pretitle %}即将上线{% endblock %}
+{% block page_title %}个人兴趣预测{% endblock %}
+{% block page_sub %}
+<div class="text-secondary mt-1">
+  本页为功能占位。上线后计划：输入单个用户 → 抓取其微博正文 → 用已训练的<strong>话题聚类模型</strong>与 <strong>GBDT</strong> 输出兴趣分类与解释。
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="row row-cards">
+  <div class="col-12 col-lg-8">
+    <div class="card">
+      <div class="card-body">
+        <div class="empty">
+          <div class="empty-icon"><i class="ti ti-hourglass-empty text-secondary" style="font-size:2.5rem"></i></div>
+          <p class="empty-title">功能开发中</p>
+          <p class="empty-subtitle text-secondary">
+            暂无表单与接口。当前批量用户流程请使用左侧「关键词抓取 → 抓取微博 → 训练 / 画像」。
+          </p>
+          <div class="empty-action">
+            <a href="/" class="btn btn-outline-primary">返回总览</a>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

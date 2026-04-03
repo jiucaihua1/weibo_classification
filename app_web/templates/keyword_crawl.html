@@ -1,0 +1,104 @@
+{% extends "layout.html" %}
+{% block title %}关键词多圈层抓取 · 微博兴趣看板{% endblock %}
+{% block page_pretitle %}终端流水线{% endblock %}
+{% block page_title %}关键词多圈层抓取{% endblock %}
+{% block page_sub %}
+<div class="text-secondary mt-1">
+  在项目根目录终端执行 <code>multidim_crawl.py</code>：关键词召回 → 写用户池 → 用户资料 → 历史推文。本页为命令说明与本地文件探测。
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="row row-cards mb-4">
+  <div class="col-12">
+    <div class="card">
+      <div class="card-header"><h3 class="card-title mb-0">三步流水线</h3></div>
+      <div class="card-body">
+        <ol class="mb-0">
+          <li class="mb-2"><strong>关键词召回</strong>：<code>tweet_by_keyword</code> → <code>output/unified_*.jsonl</code></li>
+          <li class="mb-2"><strong>均衡抽样</strong>：写入 <code>input/user_ids.txt</code>（可用 <code>--append-user-ids</code> 追加）</li>
+          <li class="mb-0"><strong>用户资料 + 时间线</strong>：<code>user</code>、<code>tweet_by_user_id</code></li>
+        </ol>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row row-cards mb-4">
+  <div class="col-12">
+    <div class="card">
+      <div class="card-header"><h3 class="card-title mb-0">示例命令</h3></div>
+      <div class="card-body">
+        <pre class="bg-dark text-light p-3 rounded small mb-3" style="white-space: pre-wrap;">cd F:\Desktop\weibo_classification
+.\.venv\Scripts\python.exe multidim_crawl.py ^
+  --keywords "手机评测,新能源车,AIGC,大模型,基金,ETF,游戏,动漫,旅游,美食,数码,摄影" ^
+  --max-pages 2 ^
+  --per-keyword-limit 100 ^
+  --total-limit 800 ^
+  --append-user-ids</pre>
+        <p class="text-secondary small mb-0">参数见 <code>multidim_crawl.py --help</code>。Cookie：<code>weibospider/cookie.txt</code>。</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row row-cards mb-4">
+  <div class="col-12">
+    <div class="card">
+      <div class="card-header d-flex flex-wrap align-items-center gap-2">
+        <h3 class="card-title mb-0">本地产物</h3>
+        <a href="/" class="btn btn-sm btn-outline-primary ms-auto">打开总览</a>
+      </div>
+      <div class="card-body p-0">
+        <div class="table-responsive">
+          <table class="table table-vcenter mb-0">
+            <thead>
+              <tr><th>说明</th><th>路径</th><th>状态</th><th>大小</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>用户池</td>
+                <td class="font-monospace small">{{ workspace.user_ids_pool_file.path }}</td>
+                <td>{% if workspace.user_ids_pool_file.exists %}<span class="badge bg-green-lt">存在</span>{% else %}<span class="badge bg-secondary-lt">无</span>{% endif %}</td>
+                <td class="small">{% if workspace.user_ids_pool_file.exists %}{{ workspace.user_ids_pool_file.size_bytes }} B{% else %}—{% endif %}</td>
+              </tr>
+              <tr>
+                <td>最新 unified</td>
+                <td class="font-monospace small">{{ workspace.unified_latest_file.path }}</td>
+                <td>{% if workspace.unified_latest_file.exists %}<span class="badge bg-green-lt">存在</span>{% else %}<span class="badge bg-secondary-lt">无</span>{% endif %}</td>
+                <td class="small">{% if workspace.unified_latest_file.exists %}{{ workspace.unified_latest_file.size_bytes }} B{% else %}—{% endif %}</td>
+              </tr>
+              <tr>
+                <td>最新 user 聚合</td>
+                <td class="font-monospace small">{{ workspace.user_aggregate_latest_file.path }}</td>
+                <td>{% if workspace.user_aggregate_latest_file.exists %}<span class="badge bg-green-lt">存在</span>{% else %}<span class="badge bg-secondary-lt">无</span>{% endif %}</td>
+                <td class="small">{% if workspace.user_aggregate_latest_file.exists %}{{ workspace.user_aggregate_latest_file.size_bytes }} B{% else %}—{% endif %}</td>
+              </tr>
+              <tr>
+                <td>合并 bundle（网页抓取）</td>
+                <td class="font-monospace small">{{ workspace.crawl_bundle.path }}</td>
+                <td>{% if workspace.crawl_bundle.exists %}<span class="badge bg-green-lt">存在</span>{% else %}<span class="badge bg-secondary-lt">无</span>{% endif %}</td>
+                <td class="small">{% if workspace.crawl_bundle.exists %}{{ workspace.crawl_bundle.size_bytes }} B{% else %}—{% endif %}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="card-body border-top text-secondary small">
+          训练 / 推断用的模型与聚类产物在 <code>output/ml_artifacts/</code>，由「训练 / 画像」步骤生成，不是抓取脚本直接写出。
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row row-cards mb-4">
+  <div class="col-12">
+    <div class="card">
+      <div class="card-body">
+        <a href="/crawl" class="btn btn-primary">按 UID 拉时间线（网页）</a>
+        <span class="text-secondary small ms-2">默认 UID 来自 <code>input/user_ids.txt</code>。</span>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

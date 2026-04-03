@@ -10,35 +10,32 @@ from collections import Counter
 from datetime import datetime
 
 from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from app_web.crawl_bundle import build_crawl_bundle, cleanup_post_crawl_artifacts, write_crawl_bundle
 from app_web.output_cleanup import cleanup_output_full, cleanup_output_selective
-from app_web.weibo_sources_service import load_user_weibo_posts
+from app_web.weibo_sources_service import load_user_weibo_posts, normalize_uid
 from app_web.workspace import (
     get_workspace_state,
-    multilabel_data_source_rows,
     rel_posix,
+    resolve_prep_source_default,
+    resolve_train_input_default,
 )
 from app_web.hot_search_service import (
     get_hot_search_speed_profile as service_get_hot_search_speed_profile,
     latest_hot_search_debug_file as service_latest_hot_search_debug_file,
     run_hot_search_sample_job as service_run_hot_search_sample_job,
 )
-from app_pipeline.clean_user_text import CleanConfig, clean_bundle_users_to_jsonl
 from app_pipeline.cluster_llm_labels import (
     generate_cluster_llm_labels,
+    generate_tweet_topic_cluster_llm,
     merge_llm_labels_into_meta,
     multilabel_jsonl_fingerprint,
     resolve_deepseek_api_key,
     try_load_cached_cluster_llm,
 )
-from app_pipeline.step1_bert_features import extract_user_features_from_cleaned_jsonl
-
-TEXT2VEC_MODEL_NAME = "shibing624/text2vec-base-chinese"
-TEXT2VEC_TOP_K = 10
-TEXT2VEC_ENCODE_BATCH_SIZE = 64
+from app_pipeline.kmeans_prep import export_kmeans_tweets_jsonl
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -51,7 +48,7 @@ PYTHON_BIN = os.path.join(PROJECT_DIR, ".venv", "Scripts", "python.exe")
 OUTPUT_DIR = os.path.join(PROJECT_DIR, "output")
 HOT_SUMMARY_LATEST_PATH = os.path.join(OUTPUT_DIR, "hot_search_keyword_user_summary_latest.json")
 WEIBO_CRAWL_LATEST_JSON = os.path.join(OUTPUT_DIR, "weibo_crawl_latest.json")
-CLEANED_USER_TEXTS_JSONL = os.path.join(OUTPUT_DIR, "cleaned_user_texts.jsonl")
+KMEANS_TWEETS_INPUT_JSONL = os.path.join(OUTPUT_DIR, "kmeans_tweets_input.jsonl")
 KMEANS_MULTILABEL_JSONL = os.path.join(OUTPUT_DIR, "kmeans_multilabel_users.jsonl")
 KMEANS_MULTILABEL_META = os.path.join(OUTPUT_DIR, "kmeans_multilabel_meta.json")
 
@@ -166,6 +163,34 @@ def _kmeans_ml_view(row: dict | None) -> dict | None:
         "threshold": row.get("threshold"),
         "distances_to_centroids": dists,
     }
+
+
+def load_cluster_llm_topic_by_label() -> dict:
+    """cluster_llm_topic.json：核心标签 -> {persona, perception, summary}，供详情页展示。"""
+    p = os.path.join(OUTPUT_DIR, "ml_artifacts", "cluster_llm_topic.json")
+    if not os.path.isfile(p):
+        return {}
+    try:
+        with open(p, "rt", encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    clusters = data.get("clusters") if isinstance(data, dict) else None
+    if not isinstance(clusters, dict):
+        return {}
+    by_label: dict = {}
+    for v in clusters.values():
+        if not isinstance(v, dict):
+            continue
+        lab = str(v.get("label", "")).strip()
+        if not lab:
+            continue
+        by_label[lab] = {
+            "persona": str(v.get("persona", "") or ""),
+            "perception": str(v.get("perception", "") or ""),
+            "summary": str(v.get("summary", "") or ""),
+        }
+    return by_label
 
 
 def _synthetic_profile_from_multilabel_row(row: dict) -> dict:
@@ -492,7 +517,8 @@ def _crawl_weibo_job(job_id: str, user_id: str, cookie: str, max_pages: int,
         swept = cleanup_post_crawl_artifacts(OUTPUT_DIR)
         _append_job_log(
             job_id,
-            f"Swept intermediates: unified={swept['unified']} user_aggregate={swept['user_aggregate']} "
+            "保留 output/unified_*.jsonl（未删除）。"
+            f" 其余清理: user_aggregate={swept['user_aggregate']} "
             f"extra_weibo_crawl_json={swept['weibo_crawl_extra']}",
         )
         _update_job(
@@ -523,9 +549,22 @@ def _crawl_weibo_job(job_id: str, user_id: str, cookie: str, max_pages: int,
 
 
 def _resolve_training_input(path: str) -> str:
+    """空路径：优先 output/kmeans_tweets_input.jsonl（步骤① 已导出），否则 bundle / unified。"""
     p = (path or "").strip()
     if not p:
-        return WEIBO_CRAWL_LATEST_JSON
+        rel = resolve_train_input_default(PROJECT_DIR, OUTPUT_DIR, WEIBO_CRAWL_LATEST_JSON)
+        return os.path.normpath(os.path.join(PROJECT_DIR, rel.replace("/", os.sep)))
+    if os.path.isabs(p):
+        return p
+    return os.path.normpath(os.path.join(PROJECT_DIR, p))
+
+
+def _resolve_prep_source(path: str) -> str:
+    """步骤① 的原始抓取路径：空则 bundle → 最新 unified。"""
+    p = (path or "").strip()
+    if not p:
+        rel = resolve_prep_source_default(PROJECT_DIR, OUTPUT_DIR, WEIBO_CRAWL_LATEST_JSON)
+        return os.path.normpath(os.path.join(PROJECT_DIR, rel.replace("/", os.sep)))
     if os.path.isabs(p):
         return p
     return os.path.normpath(os.path.join(PROJECT_DIR, p))
@@ -540,35 +579,26 @@ def _cluster_text2vec_job(job_id: str, input_path: str, k_min: int, k_max: int):
 
         env = os.environ.copy()
         model_dir = os.path.join("output", "ml_artifacts")
-        _update_job(job_id, progress=25, progress_label="① KMeans 聚类（自动选 k）…")
+        _update_job(job_id, progress=25, progress_label="① PCA(64)+K 搜索+KMeans…")
 
-        den = max(1, int(k_max) - int(k_min))
-
-        def _progress_updater(line: str):
+        def _progress_ksearch(line: str):
             if not line.startswith("[KSEARCH]"):
                 return None
-            # Examples:
-            # [KSEARCH] k=3 silhouette=0.1
-            # [KSEARCH] best_so_far_k=3 best_score=0.12
-            # [KSEARCH] best_k=3 best_score=0.12
             m = re.search(r"k=(\d+)", line)
             if not m:
                 return None
             k = int(m.group(1))
-            idx = k - int(k_min)
-            pct = idx / float(den)
-            progress = 25 + int(max(0.0, min(1.0, pct)) * 60)
-            return {
-                "progress": max(25, min(85, progress)),
-                "progress_label": line.replace("[KSEARCH] ", ""),
-            }
+            span = max(1, int(k_max) - int(k_min) + 1)
+            frac = (k - int(k_min) + 1) / float(span)
+            progress = 25 + int(max(0.0, min(1.0, frac)) * 45)
+            return {"progress": max(25, min(72, progress)), "progress_label": line.replace("[KSEARCH] ", "")}
 
         _run_cmd_stream(
             job_id,
             [
                 PYTHON_BIN,
                 "-m",
-                "app_pipeline.train",
+                "app_pipeline.train_tweet_topic",
                 "--input",
                 path,
                 "--output-dir",
@@ -577,11 +607,22 @@ def _cluster_text2vec_job(job_id: str, input_path: str, k_min: int, k_max: int):
                 str(k_min),
                 "--k-max",
                 str(k_max),
+                "--viz-only",
             ],
             PROJECT_DIR,
             env,
-            progress_updater=_progress_updater,
+            progress_updater=_progress_ksearch,
         )
+
+        # 读取聚类可视化数据（若存在）
+        viz_data = None
+        viz_path = os.path.join(model_dir, "cluster_viz_data.json")
+        if os.path.isfile(viz_path):
+            try:
+                with open(viz_path, "rt", encoding="utf-8", errors="replace") as f:
+                    viz_data = json.load(f)
+            except Exception:
+                viz_data = None
 
         _update_job(
             job_id,
@@ -591,7 +632,8 @@ def _cluster_text2vec_job(job_id: str, input_path: str, k_min: int, k_max: int):
             completed_at=datetime.now().isoformat(timespec="seconds"),
             result={
                 "model_dir": model_dir,
-                "k_search_note": "cluster results saved (user_cluster.json / kmeans_k.json)",
+                "k_search_note": "tweet-topic: PCA(64)+silhouette(k)+KMeans（仅聚类+可视化）",
+                "cluster_viz_data": viz_data,
             },
         )
     except Exception as exc:
@@ -603,6 +645,72 @@ def _cluster_text2vec_job(job_id: str, input_path: str, k_min: int, k_max: int):
             completed_at=datetime.now().isoformat(timespec="seconds"),
         )
         _append_job_log(job_id, f"Failed: {exc}")
+
+
+ML_ARTIFACTS_DIR = os.path.join(OUTPUT_DIR, "ml_artifacts")
+
+
+def _tweet_topic_cluster_llm_job(job_id: str, force: bool) -> None:
+    def _done_ts() -> str:
+        return datetime.now().isoformat(timespec="seconds")
+
+    try:
+        _update_job(job_id, status="running", progress=5, progress_label="准备 DeepSeek（推文簇深度命名）…")
+        model_s = (os.environ.get("DEEPSEEK_MODEL", "") or "deepseek-chat").strip()
+        base_url = (os.environ.get("DEEPSEEK_BASE_URL", "") or "https://api.deepseek.com").strip()
+
+        viz_path = os.path.join(ML_ARTIFACTS_DIR, "cluster_viz_data.json")
+        if not os.path.isfile(viz_path):
+            _update_job(
+                job_id,
+                status="failed",
+                error="未找到 output/ml_artifacts/cluster_viz_data.json，请先完成聚类",
+                progress_label="失败",
+                completed_at=_done_ts(),
+            )
+            return
+
+        api_key = resolve_deepseek_api_key("")
+        if not api_key:
+            _update_job(
+                job_id,
+                status="failed",
+                error="未配置 DeepSeek：请创建项目根目录 deepseek_api_key.txt 或设置 DEEPSEEK_API_KEY",
+                progress_label="失败",
+                completed_at=_done_ts(),
+            )
+            return
+
+        def _log(msg: str) -> None:
+            _append_job_log(job_id, msg)
+
+        _update_job(job_id, progress=12, progress_label="DeepSeek：逐簇分析样本文…")
+        clusters = generate_tweet_topic_cluster_llm(
+            ML_ARTIFACTS_DIR,
+            api_key=api_key,
+            base_url=base_url,
+            model=model_s,
+            sleep_s=0.85,
+            force=bool(force),
+            log=_log,
+        )
+        _update_job(
+            job_id,
+            status="completed",
+            progress=100,
+            progress_label="深度命名已写入 cluster_label_map.json",
+            completed_at=_done_ts(),
+            result={"n_clusters": len(clusters), "cluster_llm_topic": clusters},
+        )
+    except Exception as exc:
+        _append_job_log(job_id, f"失败: {exc}")
+        _update_job(
+            job_id,
+            status="failed",
+            error=str(exc),
+            progress_label="失败",
+            completed_at=_done_ts(),
+        )
 
 
 def _infer_text2vec_job(job_id: str, input_path: str):
@@ -682,28 +790,26 @@ def _cluster_and_infer_text2vec_job(job_id: str, input_path: str, k_min: int, k_
         model_dir = os.path.join("output", "ml_artifacts")
         out_path = os.path.join("output", "user_interest_profiles.json")
 
-        # stage 1: kmeans
-        _update_job(job_id, progress=25, progress_label="一键：KMeans 自动选 k…")
-        den = max(1, int(k_max) - int(k_min))
+        _update_job(job_id, progress=25, progress_label="一键：PCA(64)+K 搜索+KMeans…")
 
-        def _progress_updater(line: str):
+        def _progress_ksearch2(line: str):
             if not line.startswith("[KSEARCH]"):
                 return None
             m = re.search(r"k=(\d+)", line)
             if not m:
                 return None
             k = int(m.group(1))
-            idx = k - int(k_min)
-            pct = idx / float(den)
-            progress = 25 + int(max(0.0, min(1.0, pct)) * 60)
-            return {"progress": max(25, min(85, progress)), "progress_label": line.replace("[KSEARCH] ", "")}
+            span = max(1, int(k_max) - int(k_min) + 1)
+            frac = (k - int(k_min) + 1) / float(span)
+            progress = 25 + int(max(0.0, min(1.0, frac)) * 55)
+            return {"progress": max(25, min(78, progress)), "progress_label": line.replace("[KSEARCH] ", "")}
 
         _run_cmd_stream(
             job_id,
             [
                 PYTHON_BIN,
                 "-m",
-                "app_pipeline.train",
+                "app_pipeline.train_tweet_topic",
                 "--input",
                 path,
                 "--output-dir",
@@ -715,7 +821,7 @@ def _cluster_and_infer_text2vec_job(job_id: str, input_path: str, k_min: int, k_
             ],
             PROJECT_DIR,
             env,
-            progress_updater=_progress_updater,
+            progress_updater=_progress_ksearch2,
         )
 
         # stage 2: infer
@@ -753,13 +859,26 @@ def _cluster_and_infer_text2vec_job(job_id: str, input_path: str, k_min: int, k_
             progress_updater=_progress_updater2,
         )
 
+        viz_data = None
+        viz_path = os.path.join(model_dir, "cluster_viz_data.json")
+        if os.path.isfile(viz_path):
+            try:
+                with open(viz_path, "rt", encoding="utf-8", errors="replace") as f:
+                    viz_data = json.load(f)
+            except Exception:
+                viz_data = None
+
         _update_job(
             job_id,
             status="completed",
             progress=100,
             progress_label="一键完成",
             completed_at=datetime.now().isoformat(timespec="seconds"),
-            result={"profiles": out_path, "model_dir": model_dir},
+            result={
+                "profiles": out_path,
+                "model_dir": model_dir,
+                "cluster_viz_data": viz_data,
+            },
         )
     except Exception as exc:
         _update_job(
@@ -916,9 +1035,8 @@ def _cluster_llm_labels_job(job_id: str, force: bool) -> None:
 
 def _train_pipeline_job(job_id: str, clusters: int, input_path: str):
     try:
-        # legacy endpoint: use clusters as k_max
-        k_min = 2
-        k_max = max(2, int(clusters))
+        k_min = 8
+        k_max = min(15, max(8, int(clusters)))
         _cluster_text2vec_job(job_id, input_path=input_path, k_min=k_min, k_max=k_max)
         if jobs.get(job_id, {}).get("status") != "completed":
             return
@@ -934,80 +1052,41 @@ def _train_pipeline_job(job_id: str, clusters: int, input_path: str):
         _append_job_log(job_id, f"Failed: {exc}")
 
 
-def _clean_data_job(job_id: str, input_path: str, min_chars: int):
+def _kmeans_prep_job(job_id: str, source_path: str, min_tweet_chars: int):
+    """步骤①：从 bundle/unified 导出 output/kmeans_tweets_input.jsonl，供后续聚类/推断。"""
     try:
-        _update_job(job_id, status="running", progress=2, progress_label="prepare")
+        _update_job(job_id, status="running", progress=5, progress_label="准备源数据…")
+        src = _resolve_prep_source(source_path)
+        if not os.path.isfile(src):
+            raise RuntimeError(f"源数据不存在: {src}")
 
-        p = (input_path or "").strip()
-        if not p:
-            p = WEIBO_CRAWL_LATEST_JSON
-        if not os.path.isabs(p):
-            p = os.path.normpath(os.path.join(PROJECT_DIR, p))
-        if not os.path.isfile(p):
-            raise RuntimeError(f"clean input not found: {p}")
-
-        def _count_users_in_bundle(bundle_path: str) -> int:
-            try:
-                import ijson  # type: ignore
-
-                c = 0
-                with open(bundle_path, "rb") as f:
-                    for _ in ijson.items(f, "users.item"):
-                        c += 1
-                return c
-            except Exception:
-                with open(bundle_path, "rt", encoding="utf-8", errors="replace") as f:
-                    data = json.load(f)
-                users = data.get("users") if isinstance(data, dict) else data
-                return len(users) if isinstance(users, list) else 0
-
-        expected = _count_users_in_bundle(p)
-        _update_job(job_id, progress=8, progress_label=f"count={expected}")
-
-        def _progress_cb(processed: int, expected_users: int | None):
-            if not expected_users or expected_users <= 0:
-                pct = 10
-            else:
-                pct = int(10 + (processed / expected_users) * 80)
-                pct = max(10, min(95, pct))
+        def _on_progress(n: int) -> None:
+            pct = 10 + int(min(80.0, (n / 100000.0) * 80.0))
             _update_job(
                 job_id,
-                progress=pct,
-                progress_label=f"cleaning {processed}/{expected_users or '?'}",
+                progress=min(92, max(10, int(pct))),
+                progress_label=f"已写入 {n} 条微博…",
             )
 
-        cfg = CleanConfig(min_chars=int(min_chars))
-        result = clean_bundle_users_to_jsonl(
-            p,
-            CLEANED_USER_TEXTS_JSONL,
-            cfg=cfg,
-            expected_users=expected,
-            progress_cb=_progress_cb,
+        _update_job(job_id, progress=10, progress_label="写入 kmeans_tweets_input.jsonl…")
+        result = export_kmeans_tweets_jsonl(
+            src,
+            KMEANS_TWEETS_INPUT_JSONL,
+            min_tweet_chars=int(min_tweet_chars),
+            progress_cb=_on_progress,
         )
-
-        _update_job(job_id, status="running", progress=90, progress_label="BERT 向量化中…")
-        # 直接在清洗完成后生成用于聚类/画像的用户向量。
-        bert_meta = extract_user_features_from_cleaned_jsonl(
-            CLEANED_USER_TEXTS_JSONL,
-            OUTPUT_DIR,
-            top_k=TEXT2VEC_TOP_K,
-            device="cuda",
-            model_name=TEXT2VEC_MODEL_NAME,
-            encode_batch_size=TEXT2VEC_ENCODE_BATCH_SIZE,
-            require_full_topk=False,
-            max_users=None,
-        )
+        if int(result.get("n_tweets") or 0) <= 0:
+            raise RuntimeError("无有效微博，请检查抓取数据或调低 min_tweet_chars")
 
         _update_job(
             job_id,
             status="completed",
             progress=100,
-            progress_label="done",
+            progress_label="步骤① 完成",
             completed_at=datetime.now().isoformat(timespec="seconds"),
             result={
-                "output_jsonl": CLEANED_USER_TEXTS_JSONL,
                 **result,
-                "bert_features": bert_meta,
+                "output_jsonl": rel_posix(PROJECT_DIR, KMEANS_TWEETS_INPUT_JSONL),
             },
         )
     except Exception as exc:
@@ -1015,7 +1094,7 @@ def _clean_data_job(job_id: str, input_path: str, min_chars: int):
             job_id,
             status="failed",
             error=str(exc),
-            progress_label="failed",
+            progress_label="失败",
             completed_at=datetime.now().isoformat(timespec="seconds"),
         )
         _append_job_log(job_id, f"Failed: {exc}")
@@ -1075,6 +1154,24 @@ def api_cluster_llm_labels_run(force: int = Form(0)):
     return {"job_id": job_id, "status": "queued"}
 
 
+@app.post("/api/tweet_cluster_llm/run")
+def api_tweet_cluster_llm_run(force: int = Form(0)):
+    """
+    基于 ml_artifacts/cluster_viz_data.json 的各簇样本文，调用 DeepSeek 生成中文标签 + 深度总结，
+    并写入 cluster_label_map.json 与 cluster_llm_topic.json。
+    """
+    job_id = str(uuid.uuid4())
+    with jobs_lock:
+        jobs[job_id] = _new_job_record(job_id)
+    thread = threading.Thread(
+        target=_tweet_topic_cluster_llm_job,
+        args=(job_id, bool(int(force))),
+        daemon=True,
+    )
+    thread.start()
+    return {"job_id": job_id, "status": "queued"}
+
+
 @app.get("/api/cluster_preview")
 def api_cluster_preview():
     """
@@ -1109,10 +1206,29 @@ def api_cluster_preview():
             cid_i = int(cid)
             cluster_sizes[cid_i] = cluster_sizes.get(cid_i, 0) + 1
 
+    cluster_viz = None
+    try:
+        from app_pipeline.train_tweet_topic import ensure_cluster_viz_json
+
+        cluster_viz = ensure_cluster_viz_json(model_dir)
+    except Exception:
+        cluster_viz = None
+
+    cluster_llm_topic = None
+    topic_path = os.path.join(model_dir, "cluster_llm_topic.json")
+    if os.path.isfile(topic_path):
+        try:
+            with open(topic_path, "rt", encoding="utf-8", errors="replace") as f:
+                cluster_llm_topic = json.load(f)
+        except Exception:
+            cluster_llm_topic = None
+
     return {
         "metrics": metrics,
         "kinfo": kinfo,
         "cluster_sizes": cluster_sizes,
+        "cluster_viz": cluster_viz,
+        "cluster_llm_topic": cluster_llm_topic,
     }
 
 
@@ -1143,56 +1259,50 @@ def api_job(job_id: str):
 def api_cleanup_output(
     mode: str = Form("selective"),
     keep_ml_artifacts: int = Form(1),
-    del_hot_search: int = Form(0),
     del_crawl_intermediate: int = Form(0),
     del_crawl_bundle: int = Form(0),
     del_user_infos: int = Form(0),
     del_profiles: int = Form(0),
     del_ml_artifacts: int = Form(0),
+    del_input_user_ids: int = Form(0),
 ):
     if mode == "full":
         return cleanup_output_full(OUTPUT_DIR, keep_ml_artifacts=bool(int(keep_ml_artifacts)))
     flags = [
-        int(del_hot_search),
         int(del_crawl_intermediate),
         int(del_crawl_bundle),
         int(del_user_infos),
         int(del_profiles),
         int(del_ml_artifacts),
+        int(del_input_user_ids),
     ]
     if not any(flags):
         return JSONResponse(status_code=400, content={"error": "请至少勾选一类要删除的内容，或改用手动「清空 output」。"})
     return cleanup_output_selective(
         OUTPUT_DIR,
-        del_hot_search=bool(int(del_hot_search)),
+        project_dir=PROJECT_DIR,
         del_crawl_intermediate=bool(int(del_crawl_intermediate)),
         del_crawl_bundle=bool(int(del_crawl_bundle)),
         del_user_infos=bool(int(del_user_infos)),
         del_profiles=bool(int(del_profiles)),
         del_ml_artifacts=bool(int(del_ml_artifacts)),
+        del_input_user_ids=bool(int(del_input_user_ids)),
     )
 
 
-@app.post("/api/clean_data")
-def api_clean_data(
-    input_file: str = Form(""),
-    min_chars: int = Form(200),
+@app.post("/api/kmeans_prep")
+def api_kmeans_prep(
+    source_file: str = Form(""),
+    min_tweet_chars: int = Form(5),
 ):
-    """
-    对 `weibo_crawl_latest.json` 做数据清洗：
-    输出 `output/cleaned_user_texts.jsonl`，用于后续 TextRank / 向量化 / 建模。
-    """
+    """KMeans 步骤①：从抓取 bundle/unified 导出 output/kmeans_tweets_input.jsonl（单条已清洗，与嵌入一致）。"""
     job_id = str(uuid.uuid4())
-    path = (input_file or "").strip()
-    if not path:
-        path = WEIBO_CRAWL_LATEST_JSON
-
     with jobs_lock:
         jobs[job_id] = _new_job_record(job_id)
 
     thread = threading.Thread(
-        target=_clean_data_job,
-        args=(job_id, path, int(min_chars)),
+        target=_kmeans_prep_job,
+        args=(job_id, (source_file or "").strip(), int(min_tweet_chars)),
         daemon=True,
     )
     thread.start()
@@ -1286,7 +1396,7 @@ def api_train(
     input_file: str = Form(""),
 ):
     job_id = str(uuid.uuid4())
-    path = (input_file or "").strip() or WEIBO_CRAWL_LATEST_JSON
+    path = _resolve_training_input((input_file or "").strip())
     with jobs_lock:
         jobs[job_id] = _new_job_record(job_id)
     thread = threading.Thread(
@@ -1301,11 +1411,11 @@ def api_train(
 @app.post("/api/cluster_text2vec")
 def api_cluster_text2vec(
     input_file: str = Form(""),
-    k_min: int = Form(2),
-    k_max: int = Form(10),
+    k_min: int = Form(8),
+    k_max: int = Form(15),
 ):
     job_id = str(uuid.uuid4())
-    path = (input_file or "").strip() or WEIBO_CRAWL_LATEST_JSON
+    path = _resolve_training_input((input_file or "").strip())
     with jobs_lock:
         jobs[job_id] = _new_job_record(job_id)
     thread = threading.Thread(
@@ -1322,7 +1432,7 @@ def api_infer_text2vec(
     input_file: str = Form(""),
 ):
     job_id = str(uuid.uuid4())
-    path = (input_file or "").strip() or WEIBO_CRAWL_LATEST_JSON
+    path = _resolve_training_input((input_file or "").strip())
     with jobs_lock:
         jobs[job_id] = _new_job_record(job_id)
     thread = threading.Thread(
@@ -1337,11 +1447,11 @@ def api_infer_text2vec(
 @app.post("/api/cluster_and_infer_text2vec")
 def api_cluster_and_infer_text2vec(
     input_file: str = Form(""),
-    k_min: int = Form(2),
-    k_max: int = Form(10),
+    k_min: int = Form(8),
+    k_max: int = Form(15),
 ):
     job_id = str(uuid.uuid4())
-    path = (input_file or "").strip() or WEIBO_CRAWL_LATEST_JSON
+    path = _resolve_training_input((input_file or "").strip())
     with jobs_lock:
         jobs[job_id] = _new_job_record(job_id)
     thread = threading.Thread(
@@ -1364,7 +1474,6 @@ def dashboard(request: Request):
             request,
             "home",
             interest_distribution=dict(top_counter),
-            kmeans_multilabel_count=len(load_kmeans_multilabel()),
         ),
     )
 
@@ -1387,35 +1496,30 @@ def page_train(request: Request):
     )
 
 
-@app.get("/hot-search", response_class=HTMLResponse)
-def page_hot_search(request: Request):
+@app.get("/keyword-crawl", response_class=HTMLResponse)
+def page_keyword_crawl(request: Request):
     return templates.TemplateResponse(
         request=request,
-        name="hot_search.html",
-        context=_page_context(request, "hot_search"),
+        name="keyword_crawl.html",
+        context=_page_context(request, "keyword_crawl"),
     )
 
 
-@app.get("/clean", response_class=HTMLResponse)
-def page_clean(request: Request):
-    return templates.TemplateResponse(
-        request=request,
-        name="clean.html",
-        context=_page_context(request, "clean"),
-    )
+@app.get("/hot-search")
+def redirect_hot_search_to_keyword_crawl():
+    return RedirectResponse(url="/keyword-crawl", status_code=302)
+
+
+@app.get("/clean")
+def redirect_clean_to_train():
+    """原「数据清洗」已并入训练页步骤①，保留旧链接。"""
+    return RedirectResponse(url="/train", status_code=302)
 
 
 @app.get("/profiles", response_class=HTMLResponse)
 def page_profiles(request: Request):
     profiles = load_profiles_effective()
     user_infos = load_user_infos()
-    ml_map = _kmeans_multilabel_by_user()
-    for p in profiles:
-        uid = str(p.get("user_id", "")).strip()
-        p["kmeans_ml"] = _kmeans_ml_view(ml_map.get(uid))
-    ml_meta = load_kmeans_multilabel_meta()
-    cluster_keyword_summaries = ml_meta.get("cluster_keyword_summaries") or {}
-    cluster_display_names = _cluster_display_names(ml_meta)
     return templates.TemplateResponse(
         request=request,
         name="profiles.html",
@@ -1424,39 +1528,28 @@ def page_profiles(request: Request):
             "profiles",
             profiles=profiles,
             user_infos=user_infos,
-            cluster_keyword_summaries=cluster_keyword_summaries,
-            cluster_display_names=cluster_display_names,
         ),
     )
 
 
-@app.get("/kmeans-multilabel", response_class=HTMLResponse)
-def page_kmeans_multilabel(request: Request):
-    rows = load_kmeans_multilabel()
-    meta = load_kmeans_multilabel_meta()
-    user_infos = load_user_infos()
-    cluster_display_names = _cluster_display_names(meta)
-    multilabel_data_sources = multilabel_data_source_rows(PROJECT_DIR, OUTPUT_DIR, meta)
-    cluster_llm_ui = _cluster_llm_labels_status()
+@app.get("/personal-interest", response_class=HTMLResponse)
+def page_personal_interest(request: Request):
     return templates.TemplateResponse(
         request=request,
-        name="multilabel.html",
-        context=_page_context(
-            request,
-            "multilabel",
-            multilabel_rows=rows,
-            multilabel_meta=meta,
-            user_infos=user_infos,
-            cluster_display_names=cluster_display_names,
-            multilabel_data_sources=multilabel_data_sources,
-            cluster_llm_ui=cluster_llm_ui,
-        ),
+        name="personal_interest.html",
+        context=_page_context(request, "personal_interest"),
     )
+
+
+@app.get("/kmeans-multilabel")
+def redirect_kmeans_multilabel_legacy():
+    """旧「KMeans 多标签」页已下线，占位功能见「个人兴趣预测」。"""
+    return RedirectResponse(url="/personal-interest", status_code=302)
 
 
 @app.get("/users/{user_id}/weibo-sources", response_class=HTMLResponse)
 def page_user_weibo_sources(request: Request, user_id: str):
-    uid_key = str(user_id).strip()
+    uid_key = normalize_uid(user_id)
     posts, files_hit = load_user_weibo_posts(uid_key, OUTPUT_DIR)
     user_info = load_user_infos().get(uid_key, {})
     latest_u = latest_unified_file()
@@ -1466,7 +1559,7 @@ def page_user_weibo_sources(request: Request, user_id: str):
         name="weibo_sources.html",
         context=_page_context(
             request,
-            "multilabel",
+            "profiles",
             user_id=uid_key,
             user_info=user_info,
             weibo_posts=posts,
@@ -1478,20 +1571,21 @@ def page_user_weibo_sources(request: Request, user_id: str):
 
 @app.get("/users/{user_id}", response_class=HTMLResponse)
 def user_detail(request: Request, user_id: str):
-    uid_key = str(user_id).strip()
+    uid_key = normalize_uid(user_id)
     target = None
     for item in load_profiles_effective():
-        if str(item.get("user_id", "")).strip() == uid_key:
+        if normalize_uid(item.get("user_id")) == uid_key:
             target = item
             break
     if not target:
         raise HTTPException(status_code=404, detail="user not found")
-    user_info = load_user_infos().get(str(user_id), {})
-    kmeans_ml = _kmeans_ml_view(_kmeans_multilabel_by_user().get(str(user_id).strip()))
-    ml_meta = load_kmeans_multilabel_meta()
-    cluster_keyword_summaries = ml_meta.get("cluster_keyword_summaries") or {}
-    cluster_keywords = ml_meta.get("cluster_keywords") or {}
-    cluster_display_names = _cluster_display_names(ml_meta)
+    user_info = load_user_infos().get(uid_key, {})
+    topic_llm_by_label = load_cluster_llm_topic_by_label()
+    tm = target.get("topic_mix_from_kmeans") or {}
+    topic_mix_sorted = sorted(
+        ((k, float(v)) for k, v in tm.items() if float(v) > 1e-9),
+        key=lambda x: -x[1],
+    )
     return templates.TemplateResponse(
         request=request,
         name="detail.html",
@@ -1500,9 +1594,7 @@ def user_detail(request: Request, user_id: str):
             "profiles",
             profile=target,
             user_info=user_info,
-            kmeans_ml=kmeans_ml,
-            cluster_keyword_summaries=cluster_keyword_summaries,
-            cluster_keywords=cluster_keywords,
-            cluster_display_names=cluster_display_names,
+            topic_llm_by_label=topic_llm_by_label,
+            topic_mix_sorted=topic_mix_sorted,
         ),
     )

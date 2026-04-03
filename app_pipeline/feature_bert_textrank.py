@@ -4,7 +4,6 @@ feature_bert_textrank.py
 给定我们已爬取的 weibo_crawl_latest.json（bundle：users[].records[]），为每个用户提取一个 768 维向量：
 
 1) 数据解析与清洗 + 过滤：
-   - 用户级过滤：如果 records/raw 中出现 raw.user.verified == True，则丢弃该用户（大 V）
    - 内容级过滤：
        - source_type 必须为 'tweet'
        - text 必须不是 '转发微博'
@@ -63,20 +62,6 @@ def _text_is_retweet(text: str) -> bool:
     return t == "转发微博" or t.startswith("转发微博")
 
 
-def _is_verified_v(raw: Any) -> bool:
-    """
-    判断是否大 V：
-    - 需求：raw.user.verified == True
-    - raw 结构可能略有不同，这里做了宽容判断
-    """
-    if not isinstance(raw, dict):
-        return False
-    user = raw.get("user")
-    if isinstance(user, dict):
-        return bool(user.get("verified") is True)
-    return bool(raw.get("verified") is True)
-
-
 def _clean_text_for_keywords(text: str) -> str:
     """
     清洗文本用于关键词提取：
@@ -123,19 +108,14 @@ class FeatureExtractionConfig:
 def _build_user_long_text(records: Sequence[Dict[str, Any]]) -> str:
     """
     对一个用户的 records 做：
-    - 大 V 过滤：如果任何 record raw.user.verified == True，直接返回空
     - 非原创过滤：source_type != 'tweet' 或 text == '转发微博' 丢弃
     - 文本清洗 + 拼接
+    （大 V 不再整用户丢弃，与数据采集口径一致。）
     """
-    verified = False
     parts: List[str] = []
     for rec in records:
         if not isinstance(rec, dict):
             continue
-        raw = rec.get("raw") or {}
-        if _is_verified_v(raw):
-            verified = True
-            break
         if rec.get("source_type") != "tweet":
             continue
         text = rec.get("text") or ""
@@ -144,8 +124,6 @@ def _build_user_long_text(records: Sequence[Dict[str, Any]]) -> str:
         cleaned = _clean_text_for_keywords(str(text))
         if cleaned:
             parts.append(cleaned)
-    if verified:
-        return ""
     return " ".join(parts).strip()
 
 
