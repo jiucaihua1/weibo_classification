@@ -1,0 +1,61 @@
+{% extends "layout.html" %}
+{% block title %}原始微博 · {{ user_id }}{% endblock %}
+{% block page_pretitle %}来源{% endblock %}
+{% block page_title %}{{ user_info.nick_name or user_id }}{% endblock %}
+{% block page_sub %}
+<div class="text-secondary mt-1">
+  以下为本地 <code>output/unified_*.jsonl</code> 中该用户的抓取记录（去重后按时间倒序，最多展示 800 条）。
+  {% if latest_unified_rel %}最近扫描的 unified 文件：<code>{{ latest_unified_rel }}</code>。{% endif %}
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="row row-cards">
+  <div class="col-12">
+    <div class="card mb-3">
+      <div class="card-body d-flex flex-wrap gap-2 align-items-center">
+        <span class="text-secondary font-monospace">{{ user_id }}</span>
+        <span class="badge bg-secondary-lt">共 {{ weibo_posts|length }} 条</span>
+        {% if weibo_source_files %}
+          <span class="text-secondary small">命中文件：{% for fn in weibo_source_files %}<code class="me-1">{{ fn }}</code>{% endfor %}</span>
+        {% endif %}
+        <div class="ms-auto btn-list">
+          <a href="/kmeans-multilabel" class="btn btn-sm btn-outline-secondary">返回多标签</a>
+          <a href="/profiles" class="btn btn-sm btn-outline-secondary">画像表</a>
+          <a href="/users/{{ user_id }}" class="btn btn-sm btn-outline-primary">用户画像详情</a>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-12">
+    <div class="card">
+      <div class="card-header"><h3 class="card-title mb-0">微博列表</h3></div>
+      <div class="card-body">
+        {% if weibo_posts %}
+          <div class="divide-y">
+            {% for r in weibo_posts %}
+              <div class="py-3">
+                <div class="d-flex flex-wrap align-items-center gap-2 mb-2 small">
+                  {% if r.source_type %}<span class="badge bg-secondary-lt">{{ r.source_type }}</span>{% endif %}
+                  <span class="text-secondary">{{ r.created_at or "—" }}</span>
+                  {% if r.ip_location %}<span class="text-secondary">{{ r.ip_location }}</span>{% endif %}
+                  {% if r.weibo_source %}<span class="text-secondary">{{ r.weibo_source }}</span>{% endif %}
+                  {% if r.url %}
+                    <a href="{{ r.url }}" target="_blank" rel="noopener" class="small">打开微博</a>
+                  {% endif %}
+                </div>
+                <div class="text-break" style="white-space: pre-wrap;">{{ r.text or "（无正文）" }}</div>
+              </div>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div class="text-secondary">
+            未在 <code>unified_*.jsonl</code> 中找到该用户的微博。请先完成「抓取微博」或确认 UID 与抓取结果一致。
+          </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
