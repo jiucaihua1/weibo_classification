@@ -7,8 +7,10 @@ import threading
 import uuid
 import time
 import tempfile
+from contextlib import contextmanager
 from collections import Counter
 from datetime import datetime
+from typing import Any
 
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -38,6 +40,7 @@ from app_pipeline.cluster_llm_labels import (
 )
 from app_pipeline.kmeans_prep import export_kmeans_tweets_jsonl
 from app_pipeline.infer import infer_tweet_topic_multilabel
+from app_pipeline.tweet_text_normalize import clean_tweet_for_encode
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -58,6 +61,7 @@ app = FastAPI(title="Weibo Interest Dashboard", version="0.2.0")
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 jobs = {}
 jobs_lock = threading.Lock()
+TRAIN_LOCK_PATH = os.path.join(OUTPUT_DIR, ".train_pipeline.lock")
 
 
 def _page_context(request: Request, nav_active: str, **extra):
@@ -230,6 +234,49 @@ def load_active_labels() -> list[str]:
     return out
 
 
+def load_training_pipeline_meta() -> dict:
+    p = os.path.join(OUTPUT_DIR, "ml_artifacts", "training_pipeline.json")
+    if not os.path.isfile(p):
+        return {}
+    try:
+        with open(p, "rt", encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _build_user_extra_info_rows(user_info: dict) -> list[tuple[str, str]]:
+    if not isinstance(user_info, dict):
+        return []
+    label_map = {
+        "_id": "微博UID",
+        "verified": "是否认证",
+        "verified_type": "认证类型",
+        "verified_reason": "认证说明",
+        "gender": "性别",
+        "location": "地区",
+        "mbrank": "会员等级",
+        "mbtype": "会员类型",
+        "crawl_time": "资料抓取时间",
+    }
+    order = ["_id", "verified", "verified_type", "verified_reason", "gender", "location", "mbrank", "mbtype", "crawl_time"]
+    rows: list[tuple[str, str]] = []
+    for k in order:
+        if k not in user_info:
+            continue
+        v = user_info.get(k)
+        if v in (None, "", [], {}, "未知"):
+            continue
+        val = str(v).strip()
+        if not val:
+            continue
+        if k == "verified":
+            val = "是" if val.lower() in ("1", "true", "yes") else "否"
+        rows.append((label_map.get(k, k), val))
+    return rows
+
+
 def _try_quick_fetch_uid_posts(uid: str, *, wait_seconds: float = 5.0) -> tuple[bool, str]:
     """
     当本地无该 UID 微博时，短时触发一次 tweet_by_user_id 抓取并合并产物。
@@ -264,6 +311,22 @@ def _try_quick_fetch_uid_posts(uid: str, *, wait_seconds: float = 5.0) -> tuple[
             f.write(cookie)
     except OSError:
         return False, "写入 Cookie 文件失败"
+
+    # 先抓用户资料（user），再短抓微博（tweet_by_user_id），保证 user_infos 可补全
+    try:
+        subprocess.run(
+            [PYTHON_BIN, "run_spider.py", "user"],
+            cwd=WEIBO_DIR,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20.0,
+        )
+    except Exception:
+        # 资料抓取失败不阻断，继续尝试抓微博正文
+        pass
 
     cmd = [PYTHON_BIN, "run_spider.py", "tweet_by_user_id"]
     proc = None
@@ -313,6 +376,52 @@ def _try_quick_fetch_uid_posts(uid: str, *, wait_seconds: float = 5.0) -> tuple[
     return True, "ok"
 
 
+def _has_core_user_info(uid: str) -> bool:
+    uid_key = normalize_uid(uid)
+    if not uid_key:
+        return False
+    info = load_user_infos().get(uid_key)
+    if not isinstance(info, dict):
+        return False
+    return bool(str(info.get("nick_name", "")).strip()) and ("followers_count" in info)
+
+
+def _is_retweet_text_for_filter(text: str) -> bool:
+    t = str(text or "").strip()
+    return t == "转发微博" or t.startswith("转发微博")
+
+
+def _build_effective_rows_for_personal_infer(
+    uid_key: str,
+    posts: list[dict[str, Any]],
+    *,
+    min_tweet_chars: int,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for p in posts:
+        txt = str(p.get("text") or "").strip()
+        if not txt or _is_retweet_text_for_filter(txt):
+            continue
+        cleaned = clean_tweet_for_encode(txt)
+        if not cleaned or len(cleaned) < int(min_tweet_chars):
+            continue
+        rows.append(
+            {
+                "user_id": uid_key,
+                "item_id": str(p.get("item_id") or "").strip(),
+                "source_type": "tweet",
+                "text": cleaned,
+                "created_at": str(p.get("created_at") or "").strip(),
+                "raw": {
+                    "content": cleaned,
+                    "url": str(p.get("url") or "").strip(),
+                    "created_at": str(p.get("created_at") or "").strip(),
+                },
+            }
+        )
+    return rows
+
+
 def _predict_personal_interest_from_local(uid: str) -> dict:
     """
     用当前已训练产物对单个 UID 做即时推断：
@@ -324,6 +433,10 @@ def _predict_personal_interest_from_local(uid: str) -> dict:
     uid_key = normalize_uid(uid)
     if not uid_key:
         raise ValueError("UID 为空或格式无效")
+    _upsert_user_info_from_local(uid_key)
+    if not _has_core_user_info(uid_key):
+        _refresh_user_info_via_spider(uid_key)
+        _upsert_user_info_from_local(uid_key)
 
     model_dir = os.path.join(OUTPUT_DIR, "ml_artifacts")
     required = (
@@ -339,35 +452,25 @@ def _predict_personal_interest_from_local(uid: str) -> dict:
         raise RuntimeError(
             "模型产物不完整，请先在训练页点击「生成模型（全流程）」。缺失: " + ", ".join(missing)
         )
+    meta = load_training_pipeline_meta()
+    min_chars = int(meta.get("min_tweet_chars", 5))
 
     posts, _files_hit = load_user_weibo_posts(uid_key, OUTPUT_DIR, limit=300)
-    if not posts:
+    rows = _build_effective_rows_for_personal_infer(uid_key, posts, min_tweet_chars=min_chars)
+    if not posts or len(rows) < 1:
+        _refresh_user_info_via_spider(uid_key)
         ok, _msg = _try_quick_fetch_uid_posts(uid_key, wait_seconds=5.0)
         if ok:
+            _refresh_user_info_via_spider(uid_key)
+            _upsert_user_info_from_local(uid_key)
             posts, _files_hit = load_user_weibo_posts(uid_key, OUTPUT_DIR, limit=300)
+            rows = _build_effective_rows_for_personal_infer(uid_key, posts, min_tweet_chars=min_chars)
     if not posts:
-        raise RuntimeError("本地未找到该 UID 微博；已尝试自动短抓取 5 秒，仍无可用数据。")
-
-    rows = []
-    for p in posts:
-        txt = str(p.get("text") or "").strip()
-        if not txt:
-            continue
-        row = {
-            "user_id": uid_key,
-            "item_id": str(p.get("item_id") or "").strip(),
-            "source_type": "tweet",
-            "text": txt,
-            "created_at": str(p.get("created_at") or "").strip(),
-            "raw": {
-                "content": txt,
-                "url": str(p.get("url") or "").strip(),
-                "created_at": str(p.get("created_at") or "").strip(),
-            },
-        }
-        rows.append(row)
+        raise RuntimeError("本地未找到该 UID 微博；已尝试自动抓取并合并，仍无可用数据。")
     if not rows:
-        raise RuntimeError("该 UID 原始微博均为空文本，无法推断。")
+        raise RuntimeError(
+            f"该 UID 已抓到微博，但按当前模型阈值 min_tweet_chars={min_chars} 过滤后仍无有效文本。"
+        )
 
     tmp_dir = os.path.join(OUTPUT_DIR, "_tmp_personal_interest")
     os.makedirs(tmp_dir, exist_ok=True)
@@ -476,6 +579,177 @@ def _extract_user_infos_from_unified(unified_path: str, user_ids: list[str]) -> 
     return result
 
 
+def _upsert_user_info_from_local(uid: str) -> bool:
+    """
+    尝试从本地 unified_*.jsonl 回填单个 UID 的用户资料到 output/user_infos.json。
+    返回是否成功拿到资料（无论是已有还是新写入）。
+    """
+    uid_key = normalize_uid(uid)
+    if not uid_key:
+        return False
+
+    infos = load_user_infos()
+    existed = infos.get(uid_key) if isinstance(infos.get(uid_key), dict) else {}
+    existed = dict(existed or {})
+
+    unified_paths = sorted(
+        glob.glob(os.path.join(OUTPUT_DIR, "unified_*.jsonl")),
+        key=os.path.getmtime,
+        reverse=True,
+    )
+    hit = None
+    for p in unified_paths:
+        try:
+            with open(p, "rt", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if normalize_uid(row.get("user_id")) != uid_key:
+                        continue
+                    raw = row.get("raw") or {}
+                    if not isinstance(raw, dict):
+                        continue
+                    if "nick_name" in raw or "followers_count" in raw or "avatar_hd" in raw:
+                        hit = raw
+                        break
+        except OSError:
+            continue
+        if hit:
+            break
+
+    # unified 未命中时，补扫 bundle
+    if not hit:
+        bundle_path = os.path.join(OUTPUT_DIR, "weibo_crawl_latest.json")
+        if os.path.isfile(bundle_path):
+            try:
+                with open(bundle_path, "rt", encoding="utf-8", errors="replace") as f:
+                    bundle = json.load(f)
+                users = bundle.get("users") if isinstance(bundle, dict) else None
+                if isinstance(users, list):
+                    for u in users:
+                        if not isinstance(u, dict):
+                            continue
+                        if normalize_uid(u.get("user_id")) != uid_key:
+                            continue
+                        recs = u.get("records") or []
+                        for rec in recs:
+                            if not isinstance(rec, dict):
+                                continue
+                            raw = rec.get("raw") or {}
+                            if not isinstance(raw, dict):
+                                continue
+                            if "nick_name" in raw or "followers_count" in raw or "avatar_hd" in raw:
+                                hit = raw
+                                break
+                        if hit:
+                            break
+            except (OSError, json.JSONDecodeError):
+                pass
+
+    # 若本地无新资料，但已有资料，认为可用
+    if not hit:
+        return bool(existed)
+
+    merged = dict(existed)
+    changed = False
+    for k, v in hit.items():
+        if v in (None, "", [], {}, "未知"):
+            continue
+        old_v = merged.get(k)
+        if old_v in (None, "", [], {}, "未知") or old_v != v:
+            merged[k] = v
+            changed = True
+
+    if not merged:
+        return False
+    if changed or uid_key not in infos:
+        infos[uid_key] = merged
+        os.makedirs(os.path.dirname(USER_INFO_PATH), exist_ok=True)
+        with open(USER_INFO_PATH, "wt", encoding="utf-8") as f:
+            json.dump(infos, f, ensure_ascii=False, indent=2)
+    return True
+
+
+def _refresh_user_info_via_spider(uid: str) -> bool:
+    """
+    复用 _crawl_weibo_job 的稳定路径：run_spider user -> unified -> extract -> user_infos。
+    """
+    uid_key = normalize_uid(uid)
+    if not uid_key or not os.path.isfile(COOKIE_PATH):
+        return False
+    try:
+        with open(COOKIE_PATH, "rt", encoding="utf-8", errors="replace") as f:
+            cookie = f.read().strip()
+    except OSError:
+        return False
+    if not cookie:
+        return False
+
+    env = os.environ.copy()
+    env["WEIBO_USER_IDS"] = uid_key
+    env["WEIBO_CRAWL_TIME_SPAN"] = "false"
+    env["WEIBO_MAX_PAGES"] = "3"
+    env["WEIBO_DOWNLOAD_DELAY"] = "1.0"
+    env["WEIBO_CONCURRENT_REQUESTS"] = "2"
+    env["WEIBO_RETRY_TIMES"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+
+    try:
+        with open(COOKIE_PATH, "wt", encoding="utf-8") as f:
+            f.write(cookie)
+    except OSError:
+        return False
+
+    before = _list_unified_files()
+    try:
+        subprocess.run(
+            [PYTHON_BIN, "run_spider.py", "user"],
+            cwd=WEIBO_DIR,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60.0,
+        )
+    except Exception:
+        return False
+
+    after = _list_unified_files()
+    candidate = _pick_new_unified(before, after)
+    paths = [candidate] if candidate else sorted(list(after), key=os.path.getmtime, reverse=True)[:8]
+    infos = load_user_infos()
+    for p in paths:
+        if not p:
+            continue
+        try:
+            extra = _extract_user_infos_from_unified(p, [uid_key])
+        except Exception:
+            extra = {}
+        row = extra.get(uid_key)
+        if not isinstance(row, dict) or not row:
+            continue
+        cur = infos.get(uid_key, {}) if isinstance(infos.get(uid_key), dict) else {}
+        merged = dict(cur)
+        for k, v in row.items():
+            if v in (None, "", [], {}, "未知"):
+                continue
+            merged[k] = v
+        infos[uid_key] = merged
+        os.makedirs(os.path.dirname(USER_INFO_PATH), exist_ok=True)
+        with open(USER_INFO_PATH, "wt", encoding="utf-8") as f:
+            json.dump(infos, f, ensure_ascii=False, indent=2)
+        return True
+    return False
+
+
 def _parse_user_ids(user_ids_raw: str) -> list[str]:
     return [x.strip() for x in (user_ids_raw or "").split(",") if x.strip()]
 
@@ -525,6 +799,38 @@ def _update_job(job_id: str, **kwargs):
             job.update(kwargs)
 
 
+@contextmanager
+def _acquire_train_pipeline_lock():
+    """
+    跨进程互斥：防止重复训练并发执行导致卡顿/资源争抢。
+    使用 O_EXCL 创建锁文件，释放时删除。
+    """
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    fd = None
+    try:
+        fd = os.open(TRAIN_LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        payload = {
+            "pid": os.getpid(),
+            "time": datetime.now().isoformat(timespec="seconds"),
+        }
+        os.write(fd, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        yield
+    except FileExistsError:
+        raise RuntimeError(
+            "已有训练任务在运行中（训练互斥锁生效），请等待当前任务结束后再启动。"
+        )
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.remove(TRAIN_LOCK_PATH)
+            except OSError:
+                pass
+
+
 def _latest_hot_search_debug_file() -> str:
     return service_latest_hot_search_debug_file(OUTPUT_DIR)
 
@@ -541,10 +847,14 @@ def _run_cmd(job_id: str, cmd: list[str], cwd: str, env: dict):
         except (TypeError, ValueError):
             timeout_sec = None
     try:
+        env2 = dict(env or {})
+        # 强制子进程统一 UTF-8，避免 Windows 默认代码页导致网页日志乱码
+        env2["PYTHONIOENCODING"] = "utf-8"
+        env2["PYTHONUTF8"] = "1"
         completed = subprocess.run(
             cmd,
             cwd=cwd,
-            env=env,
+            env=env2,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -589,6 +899,8 @@ def _run_cmd_stream(
 
     env2 = dict(env or {})
     env2["PYTHONUNBUFFERED"] = "1"
+    env2["PYTHONIOENCODING"] = "utf-8"
+    env2["PYTHONUTF8"] = "1"
 
     start = time.time()
     proc = subprocess.Popen(
@@ -1002,105 +1314,106 @@ def _cluster_and_infer_text2vec_job(job_id: str, input_path: str, k_min: int, k_
     一键流程：① KMeans 自动选 k -> ② infer 生成兴趣画像。
     """
     try:
-        _update_job(job_id, status="running", progress=8, progress_label="一键：加载特征…")
-        path = _resolve_training_input(input_path)
-        if not os.path.isfile(path):
-            raise RuntimeError(f"bundle not found: {path}")
+        with _acquire_train_pipeline_lock():
+            _update_job(job_id, status="running", progress=8, progress_label="一键：加载特征…")
+            path = _resolve_training_input(input_path)
+            if not os.path.isfile(path):
+                raise RuntimeError(f"bundle not found: {path}")
 
-        env = os.environ.copy()
-        model_dir = os.path.join("output", "ml_artifacts")
-        out_path = os.path.join("output", "user_interest_profiles.json")
+            env = os.environ.copy()
+            model_dir = os.path.join("output", "ml_artifacts")
+            out_path = os.path.join("output", "user_interest_profiles.json")
 
-        _update_job(job_id, progress=25, progress_label="一键：PCA(64)+K 搜索+KMeans…")
+            _update_job(job_id, progress=25, progress_label="一键：PCA(64)+K 搜索+KMeans…")
 
-        def _progress_ksearch2(line: str):
-            if not line.startswith("[KSEARCH]"):
-                return None
-            m = re.search(r"k=(\d+)", line)
-            if not m:
-                return None
-            k = int(m.group(1))
-            span = max(1, int(k_max) - int(k_min) + 1)
-            frac = (k - int(k_min) + 1) / float(span)
-            progress = 25 + int(max(0.0, min(1.0, frac)) * 55)
-            return {"progress": max(25, min(78, progress)), "progress_label": line.replace("[KSEARCH] ", "")}
+            def _progress_ksearch2(line: str):
+                if not line.startswith("[KSEARCH]"):
+                    return None
+                m = re.search(r"k=(\d+)", line)
+                if not m:
+                    return None
+                k = int(m.group(1))
+                span = max(1, int(k_max) - int(k_min) + 1)
+                frac = (k - int(k_min) + 1) / float(span)
+                progress = 25 + int(max(0.0, min(1.0, frac)) * 55)
+                return {"progress": max(25, min(78, progress)), "progress_label": line.replace("[KSEARCH] ", "")}
 
-        _run_cmd_stream(
-            job_id,
-            [
-                PYTHON_BIN,
-                "-m",
-                "app_pipeline.train_tweet_topic",
-                "--input",
-                path,
-                "--output-dir",
-                model_dir,
-                "--k-min",
-                str(k_min),
-                "--k-max",
-                str(k_max),
-            ],
-            PROJECT_DIR,
-            env,
-            progress_updater=_progress_ksearch2,
-        )
+            _run_cmd_stream(
+                job_id,
+                [
+                    PYTHON_BIN,
+                    "-m",
+                    "app_pipeline.train_tweet_topic",
+                    "--input",
+                    path,
+                    "--output-dir",
+                    model_dir,
+                    "--k-min",
+                    str(k_min),
+                    "--k-max",
+                    str(k_max),
+                ],
+                PROJECT_DIR,
+                env,
+                progress_updater=_progress_ksearch2,
+            )
 
-        # stage 2: infer
-        _update_job(job_id, progress=85, progress_label="一键：生成兴趣画像（infer）…")
+            # stage 2: infer
+            _update_job(job_id, progress=85, progress_label="一键：生成兴趣画像（infer）…")
 
-        def _progress_updater2(line: str):
-            if not line.startswith("[INFER]"):
-                return None
-            m = re.search(r"profiles=(\d+)/(\d+)", line)
-            if not m:
-                return None
-            done = int(m.group(1))
-            total = int(m.group(2))
-            if total <= 0:
-                return None
-            pct = done / float(total)
-            progress = 85 + int(max(0.0, min(1.0, pct)) * 12)
-            return {"progress": max(85, min(98, progress)), "progress_label": line.replace("[INFER] ", "")}
+            def _progress_updater2(line: str):
+                if not line.startswith("[INFER]"):
+                    return None
+                m = re.search(r"profiles=(\d+)/(\d+)", line)
+                if not m:
+                    return None
+                done = int(m.group(1))
+                total = int(m.group(2))
+                if total <= 0:
+                    return None
+                pct = done / float(total)
+                progress = 85 + int(max(0.0, min(1.0, pct)) * 12)
+                return {"progress": max(85, min(98, progress)), "progress_label": line.replace("[INFER] ", "")}
 
-        _run_cmd_stream(
-            job_id,
-            [
-                PYTHON_BIN,
-                "-m",
-                "app_pipeline.infer",
-                "--input",
-                path,
-                "--model-dir",
-                model_dir,
-                "--output",
-                out_path,
-            ],
-            PROJECT_DIR,
-            env,
-            progress_updater=_progress_updater2,
-        )
+            _run_cmd_stream(
+                job_id,
+                [
+                    PYTHON_BIN,
+                    "-m",
+                    "app_pipeline.infer",
+                    "--input",
+                    path,
+                    "--model-dir",
+                    model_dir,
+                    "--output",
+                    out_path,
+                ],
+                PROJECT_DIR,
+                env,
+                progress_updater=_progress_updater2,
+            )
 
-        viz_data = None
-        viz_path = os.path.join(model_dir, "cluster_viz_data.json")
-        if os.path.isfile(viz_path):
-            try:
-                with open(viz_path, "rt", encoding="utf-8", errors="replace") as f:
-                    viz_data = json.load(f)
-            except Exception:
-                viz_data = None
+            viz_data = None
+            viz_path = os.path.join(model_dir, "cluster_viz_data.json")
+            if os.path.isfile(viz_path):
+                try:
+                    with open(viz_path, "rt", encoding="utf-8", errors="replace") as f:
+                        viz_data = json.load(f)
+                except Exception:
+                    viz_data = None
 
-        _update_job(
-            job_id,
-            status="completed",
-            progress=100,
-            progress_label="一键完成",
-            completed_at=datetime.now().isoformat(timespec="seconds"),
-            result={
-                "profiles": out_path,
-                "model_dir": model_dir,
-                "cluster_viz_data": viz_data,
-            },
-        )
+            _update_job(
+                job_id,
+                status="completed",
+                progress=100,
+                progress_label="一键完成",
+                completed_at=datetime.now().isoformat(timespec="seconds"),
+                result={
+                    "profiles": out_path,
+                    "model_dir": model_dir,
+                    "cluster_viz_data": viz_data,
+                },
+            )
     except Exception as exc:
         _update_job(
             job_id,
@@ -1887,9 +2200,15 @@ def user_detail(request: Request, user_id: str):
             target = item
             break
     if not target:
-        raise HTTPException(status_code=404, detail="user not found")
+        try:
+            # 与“个人兴趣预测”页打通：若主画像文件里无该 UID，则即时补算后直接展示详情页
+            target = _predict_personal_interest_from_local(uid_key)
+        except Exception:
+            raise HTTPException(status_code=404, detail="user not found") from None
     user_info = load_user_infos().get(uid_key, {})
+    user_extra_info_rows = _build_user_extra_info_rows(user_info)
     topic_llm_by_label = load_cluster_llm_topic_by_label()
+    training_meta = load_training_pipeline_meta()
     tm = target.get("topic_mix_from_kmeans") or {}
     active_labels = load_active_labels()
     mix_vals = {str(k): float(v) for k, v in tm.items() if float(v) > 1e-9}
@@ -1909,7 +2228,9 @@ def user_detail(request: Request, user_id: str):
             "profiles",
             profile=target,
             user_info=user_info,
+            user_extra_info_rows=user_extra_info_rows,
             topic_llm_by_label=topic_llm_by_label,
             topic_mix_sorted=topic_mix_sorted,
+            training_meta=training_meta,
         ),
     )

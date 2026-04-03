@@ -41,6 +41,9 @@
         <h3 class="card-title mb-0">预测结果</h3>
         <span class="badge bg-blue-lt">UID {{ predict_profile.user_id }}</span>
         <span class="badge bg-secondary-lt">样本 {{ predict_profile.sample_size }}</span>
+        <div class="ms-auto">
+          <a href="/users/{{ predict_profile.user_id }}" class="btn btn-sm btn-outline-primary">打开详情页</a>
+        </div>
       </div>
       <div class="card-body">
         <div class="mb-3">
