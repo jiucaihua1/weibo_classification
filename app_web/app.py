@@ -6,6 +6,7 @@ import subprocess
 import threading
 import uuid
 import time
+import tempfile
 from collections import Counter
 from datetime import datetime
 
@@ -36,6 +37,7 @@ from app_pipeline.cluster_llm_labels import (
     try_load_cached_cluster_llm,
 )
 from app_pipeline.kmeans_prep import export_kmeans_tweets_jsonl
+from app_pipeline.infer import infer_tweet_topic_multilabel
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -191,6 +193,117 @@ def load_cluster_llm_topic_by_label() -> dict:
             "summary": str(v.get("summary", "") or ""),
         }
     return by_label
+
+
+def load_active_labels() -> list[str]:
+    """读取动态标签维度（由训练期写入 ml_artifacts/active_labels.json）。"""
+    p = os.path.join(OUTPUT_DIR, "ml_artifacts", "active_labels.json")
+    if not os.path.isfile(p):
+        return []
+    try:
+        with open(p, "rt", encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    raw = data.get("active_labels") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in raw:
+        s = str(x or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _predict_personal_interest_from_local(uid: str) -> dict:
+    """
+    用当前已训练产物对单个 UID 做即时推断：
+    1) 从 unified/bundle 收集该 UID 原始微博；
+    2) 构造临时 jsonl；
+    3) 调用 infer_tweet_topic_multilabel；
+    4) 返回该用户画像。
+    """
+    uid_key = normalize_uid(uid)
+    if not uid_key:
+        raise ValueError("UID 为空或格式无效")
+
+    model_dir = os.path.join(OUTPUT_DIR, "ml_artifacts")
+    required = (
+        "training_pipeline.json",
+        "kmeans_tweet_model.pkl",
+        "tweet_pca_64.pkl",
+        "gbdt_multilabel.pkl",
+        "cluster_label_map.json",
+        "active_labels.json",
+    )
+    missing = [name for name in required if not os.path.isfile(os.path.join(model_dir, name))]
+    if missing:
+        raise RuntimeError(
+            "模型产物不完整，请先在训练页点击「生成模型（全流程）」。缺失: " + ", ".join(missing)
+        )
+
+    posts, _files_hit = load_user_weibo_posts(uid_key, OUTPUT_DIR, limit=300)
+    if not posts:
+        raise RuntimeError("本地未找到该 UID 的原始微博，请先抓取并确认 unified/bundle 内存在该 UID。")
+
+    rows = []
+    for p in posts:
+        txt = str(p.get("text") or "").strip()
+        if not txt:
+            continue
+        row = {
+            "user_id": uid_key,
+            "item_id": str(p.get("item_id") or "").strip(),
+            "source_type": "tweet",
+            "text": txt,
+            "created_at": str(p.get("created_at") or "").strip(),
+            "raw": {
+                "content": txt,
+                "url": str(p.get("url") or "").strip(),
+                "created_at": str(p.get("created_at") or "").strip(),
+            },
+        }
+        rows.append(row)
+    if not rows:
+        raise RuntimeError("该 UID 原始微博均为空文本，无法推断。")
+
+    tmp_dir = os.path.join(OUTPUT_DIR, "_tmp_personal_interest")
+    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_in = tempfile.NamedTemporaryFile(
+        mode="wt",
+        encoding="utf-8",
+        delete=False,
+        suffix=".jsonl",
+        dir=tmp_dir,
+    )
+    tmp_out = os.path.join(tmp_dir, f"personal_interest_{uid_key}_{uuid.uuid4().hex}.json")
+    try:
+        with tmp_in as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        profiles = infer_tweet_topic_multilabel(tmp_in.name, model_dir, tmp_out)
+        target = None
+        for p in profiles:
+            if normalize_uid(p.get("user_id")) == uid_key:
+                target = p
+                break
+        if not target and profiles:
+            target = profiles[0]
+        if not isinstance(target, dict):
+            raise RuntimeError("推断未返回有效结果，请检查模型与输入数据。")
+        target["source_post_count"] = len(rows)
+        return target
+    finally:
+        for p in (tmp_in.name, tmp_out):
+            if p and os.path.isfile(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
 
 def _synthetic_profile_from_multilabel_row(row: dict) -> dict:
@@ -501,17 +614,27 @@ def _crawl_weibo_job(job_id: str, user_id: str, cookie: str, max_pages: int,
 
         _update_job(job_id, progress=45, progress_label="② 抓取用户微博（tweet_by_user_id）…")
         _run_cmd(job_id, [PYTHON_BIN, "run_spider.py", "tweet_by_user_id"], WEIBO_DIR, env)
+        # 统一在：抓取结束后把 output 目录下所有 unified_*.jsonl 合并进
+        # output/weibo_crawl_latest.json，确保多次抓取会“累积”而不是覆盖/丢用户。
+        after_pipeline = _list_unified_files()
         unified = latest_unified_file()
         if not unified:
             raise RuntimeError("No unified file produced after crawl.")
-        after_pipeline = _list_unified_files()
-        generated_unified = list(after_pipeline - before_pipeline)
+        all_unified_sorted = sorted(list(after_pipeline), key=lambda p: os.path.basename(p))
         ordered_ids = _ordered_unique_user_ids(user_id)
         _update_job(job_id, progress=78, progress_label="③ 合并为 weibo_crawl_latest.json …")
-        payload = build_crawl_bundle(job_id=job_id, user_ids_ordered=ordered_ids, unified_paths=generated_unified)
+        from app_pipeline.merge_unified_to_bundle import merge_paths
+
+        payload, n_in, n_dup = merge_paths([str(p) for p in all_unified_sorted])
         latest_path, _archive_placeholder = write_crawl_bundle(OUTPUT_DIR, job_id, payload)
-        n_with_data = sum(1 for u in payload["users"] if u.get("records"))
+        ordered_set = set(ordered_ids)
+        n_with_data = sum(
+            1
+            for u in (payload.get("users") or [])
+            if str(u.get("user_id", "")).strip() in ordered_set and u.get("records")
+        )
         _append_job_log(job_id, f"Crawl bundle saved: {latest_path}")
+        _append_job_log(job_id, f"Merge unified_*.jsonl: lines_read={n_in} duplicates_skipped={n_dup}")
         _append_job_log(job_id, f"Users with at least one record: {n_with_data} / {len(ordered_ids)}")
         _update_job(job_id, progress=92, progress_label="④ 清理中间文件…")
         swept = cleanup_post_crawl_artifacts(OUTPUT_DIR)
@@ -880,6 +1003,41 @@ def _cluster_and_infer_text2vec_job(job_id: str, input_path: str, k_min: int, k_
                 "cluster_viz_data": viz_data,
             },
         )
+    except Exception as exc:
+        _update_job(
+            job_id,
+            status="failed",
+            error=str(exc),
+            progress_label="失败",
+            completed_at=datetime.now().isoformat(timespec="seconds"),
+        )
+        _append_job_log(job_id, f"Failed: {exc}")
+
+
+def _build_model_all_job(
+    job_id: str,
+    source_file: str,
+    min_tweet_chars: int,
+    input_file: str,
+    k_min: int,
+    k_max: int,
+    llm_force: bool = False,
+):
+    """
+    训练页单按钮全流程：
+    ① kmeans_prep -> ②+③ cluster_and_infer
+    说明：DeepSeek 簇命名已并入 train_tweet_topic 训练阶段，以保证 GBDT 动态标签维度与簇标签一致。
+    """
+    try:
+        _update_job(job_id, status="running", progress=2, progress_label="全流程：准备…")
+        _kmeans_prep_job(job_id, source_path=source_file, min_tweet_chars=int(min_tweet_chars))
+        if jobs.get(job_id, {}).get("status") != "completed":
+            return
+        _cluster_and_infer_text2vec_job(job_id, input_path=input_file, k_min=int(k_min), k_max=int(k_max))
+        if jobs.get(job_id, {}).get("status") != "completed":
+            return
+        if bool(llm_force):
+            _append_job_log(job_id, "提示：当前训练阶段已执行 DeepSeek 命名；无需额外强制重命名。")
     except Exception as exc:
         _update_job(
             job_id,
@@ -1463,6 +1621,28 @@ def api_cluster_and_infer_text2vec(
     return {"job_id": job_id, "status": "queued"}
 
 
+@app.post("/api/build_model_all")
+def api_build_model_all(
+    source_file: str = Form(""),
+    min_tweet_chars: int = Form(5),
+    input_file: str = Form(""),
+    k_min: int = Form(8),
+    k_max: int = Form(15),
+    llm_force: int = Form(0),
+):
+    """训练页单按钮：导出输入 -> 聚类+画像 -> DeepSeek 命名。"""
+    job_id = str(uuid.uuid4())
+    with jobs_lock:
+        jobs[job_id] = _new_job_record(job_id)
+    thread = threading.Thread(
+        target=_build_model_all_job,
+        args=(job_id, source_file, int(min_tweet_chars), input_file, int(k_min), int(k_max), bool(int(llm_force))),
+        daemon=True,
+    )
+    thread.start()
+    return {"job_id": job_id, "status": "queued"}
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request):
     profiles = load_profiles_effective()
@@ -1520,6 +1700,19 @@ def redirect_clean_to_train():
 def page_profiles(request: Request):
     profiles = load_profiles_effective()
     user_infos = load_user_infos()
+    meta = load_kmeans_multilabel_meta()
+    by_uid = _kmeans_multilabel_by_user()
+    cid2name = _cluster_display_names(meta)
+    for p in profiles:
+        uid = str(p.get("user_id", "")).strip()
+        live_label = str(p.get("top_interest", "") or "")
+        row = by_uid.get(uid)
+        if isinstance(row, dict):
+            cid = row.get("primary_cluster")
+            key = str(cid) if cid is not None else ""
+            if key and key in cid2name:
+                live_label = str(cid2name.get(key) or live_label)
+        p["top_interest_live"] = live_label
     return templates.TemplateResponse(
         request=request,
         name="profiles.html",
@@ -1533,11 +1726,29 @@ def page_profiles(request: Request):
 
 
 @app.get("/personal-interest", response_class=HTMLResponse)
-def page_personal_interest(request: Request):
+def page_personal_interest(request: Request, user_id: str = ""):
+    uid = normalize_uid(user_id)
+    result = None
+    error = ""
+    if uid:
+        try:
+            result = _predict_personal_interest_from_local(uid)
+        except Exception as exc:
+            error = str(exc)
+    user_info = load_user_infos().get(uid, {}) if uid else {}
+    active_labels = load_active_labels()
     return templates.TemplateResponse(
         request=request,
         name="personal_interest.html",
-        context=_page_context(request, "personal_interest"),
+        context=_page_context(
+            request,
+            "personal_interest",
+            query_uid=uid,
+            predict_error=error,
+            predict_profile=result,
+            user_info=user_info,
+            active_labels=active_labels,
+        ),
     )
 
 
@@ -1582,10 +1793,16 @@ def user_detail(request: Request, user_id: str):
     user_info = load_user_infos().get(uid_key, {})
     topic_llm_by_label = load_cluster_llm_topic_by_label()
     tm = target.get("topic_mix_from_kmeans") or {}
-    topic_mix_sorted = sorted(
-        ((k, float(v)) for k, v in tm.items() if float(v) > 1e-9),
-        key=lambda x: -x[1],
-    )
+    active_labels = load_active_labels()
+    mix_vals = {str(k): float(v) for k, v in tm.items() if float(v) > 1e-9}
+    if active_labels:
+        rank = {lab: i for i, lab in enumerate(active_labels)}
+        topic_mix_sorted = sorted(
+            mix_vals.items(),
+            key=lambda x: (rank.get(x[0], 10**9), -x[1], x[0]),
+        )
+    else:
+        topic_mix_sorted = sorted(mix_vals.items(), key=lambda x: -x[1])
     return templates.TemplateResponse(
         request=request,
         name="detail.html",

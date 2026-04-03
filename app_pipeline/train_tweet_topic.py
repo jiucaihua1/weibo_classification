@@ -1,7 +1,5 @@
 """
 Train: 单条微博向量 → K-Means（话题簇）→ 用户多标签比例（门槛）→ GBDT 多输出。
-
-复用 train.py 中的簇中心→兴趣标签映射与 INTEREST_LABELS。
 """
 
 from __future__ import annotations
@@ -10,6 +8,7 @@ import argparse
 import json
 import os
 import pickle
+import time
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -20,15 +19,15 @@ from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.manifold import TSNE
 from sklearn.metrics import silhouette_score
 
+from app_pipeline.cluster_llm_labels import (
+    generate_tweet_topic_cluster_llm,
+    resolve_deepseek_api_key,
+)
 from app_pipeline.feature_tweet_embeddings import (
     TweetEmbeddingConfig,
     extract_tweet_embeddings,
     mean_embedding_by_user,
     static_features_for_users,
-)
-from app_pipeline.train import (
-    INTEREST_LABELS,
-    KEYWORD_HINTS,
 )
 
 
@@ -46,55 +45,31 @@ def _subsample_for_score(n: int, max_n: int = 8000, seed: int = 42) -> np.ndarra
 NOISE_LABEL = "Noise"
 
 
-def _map_clusters_to_labels_by_hint_embeddings_in_pca(
-    cluster_centers_pca: np.ndarray,
-    *,
-    tweet_pca: PCA,
-    device: str,
-    embed_model_name: str,
-    sim_threshold: float,
-) -> Tuple[Dict[int, str], List[int]]:
-    """
-    Map cluster centers (in PCA space) to interest labels (8 classes).
-    Label embeddings are PCA-projected to the same space as cluster centers.
-    If max cosine similarity to any label < sim_threshold, cluster -> Noise (ignored in Y).
-    """
-    from sentence_transformers import SentenceTransformer
+def _is_noise_label_name(label: str) -> bool:
+    s = str(label or "").strip().lower()
+    if not s:
+        return True
+    if s == "noise":
+        return True
+    for token in ("噪声", "杂谈", "闲聊", "无意义", "其他", "misc", "unknown", "暂无文本"):
+        if token in s:
+            return True
+    return False
 
-    st = SentenceTransformer(embed_model_name, device=device)
+
+def _build_dynamic_labels(cluster_label_map: Dict[int, str]) -> Tuple[List[str], List[int]]:
     labels: List[str] = []
-    label_texts: List[str] = []
-    for lab, words in KEYWORD_HINTS.items():
-        labels.append(lab)
-        label_texts.append(" ".join(sorted(words)))
-
-    label_vecs = st.encode(
-        label_texts,
-        batch_size=16,
-        show_progress_bar=False,
-        convert_to_numpy=True,
-        normalize_embeddings=False,
-    ).astype(np.float32, copy=False)
-
-    label_vecs_pca = tweet_pca.transform(label_vecs).astype(np.float32, copy=False)
-
-    a_norm = _normalize_rows(cluster_centers_pca.astype(np.float32, copy=False))
-    b_norm = _normalize_rows(label_vecs_pca.astype(np.float32, copy=False))
-    sims = a_norm @ b_norm.T  # (n_clusters, n_labels)
-
-    mapping: Dict[int, str] = {}
+    seen: set[str] = set()
     noise_ids: List[int] = []
-    thr = float(sim_threshold)
-    for cluster_id in range(sims.shape[0]):
-        row = sims[cluster_id]
-        best_idx = int(np.argmax(row))
-        best_sim = float(row[best_idx])
-        if best_sim < thr:
-            mapping[cluster_id] = NOISE_LABEL
-            noise_ids.append(cluster_id)
-        else:
-            mapping[cluster_id] = labels[best_idx]
-    return mapping, noise_ids
+    for cid in sorted(cluster_label_map.keys()):
+        lab = str(cluster_label_map.get(cid, "") or "").strip()
+        if _is_noise_label_name(lab):
+            noise_ids.append(int(cid))
+            continue
+        if lab not in seen:
+            seen.add(lab)
+            labels.append(lab)
+    return labels, noise_ids
 
 
 def _build_cluster_viz_data(
@@ -519,20 +494,35 @@ def train_tweet_topic_pipeline(
             "k_max": int(k_hi),
         }
 
-    cluster_label_map, noise_cluster_ids = _map_clusters_to_labels_by_hint_embeddings_in_pca(
-        km.cluster_centers_,
-        tweet_pca=tweet_pca,
-        device=device,
-        embed_model_name=model_name,
-        sim_threshold=float(cluster_label_sim_threshold),
+    print("[STEP3] DeepSeek 命名簇标签（训练标签维度将由 AI 标签动态确定）…", flush=True)
+    api_key = resolve_deepseek_api_key("")
+    if not api_key:
+        raise RuntimeError(
+            "未配置 DeepSeek Key：请创建项目根目录 deepseek_api_key.txt 或设置 DEEPSEEK_API_KEY。"
+        )
+    llm_clusters = generate_tweet_topic_cluster_llm(
+        output_dir,
+        api_key=api_key,
+        base_url=(os.environ.get("DEEPSEEK_BASE_URL", "") or "https://api.deepseek.com").strip(),
+        model=(os.environ.get("DEEPSEEK_MODEL", "") or "deepseek-chat").strip(),
+        force=False,
     )
+    cluster_label_map: Dict[int, str] = {}
+    for cid in sorted({int(x) for x in tweet_cluster_ids.tolist()}):
+        item = llm_clusters.get(str(cid)) or {}
+        raw_label = str(item.get("label", "")).strip() or f"簇{cid}"
+        cluster_label_map[int(cid)] = raw_label
+
+    interest_labels, noise_cluster_ids = _build_dynamic_labels(cluster_label_map)
+    if not interest_labels:
+        raise RuntimeError("DeepSeek 命名结果全为 Noise/无效标签，无法训练动态多标签 GBDT。")
 
     users_ml, Y, _ratios = _build_user_multilabel_from_tweets(
         tweet_user_ids,
         tweet_cluster_ids,
         {int(k): v for k, v in cluster_label_map.items()},
         label_threshold=label_threshold,
-        interest_labels=INTEREST_LABELS,
+        interest_labels=interest_labels,
     )
     if len(users_ml) < 2:
         raise ValueError("聚类后有效用户不足（少于 2），无法训练 GBDT。")
@@ -586,6 +576,17 @@ def train_tweet_topic_pipeline(
         )
     with open(os.path.join(output_dir, "cluster_label_map.json"), "wt", encoding="utf-8") as f:
         json.dump({str(k): v for k, v in cluster_label_map.items()}, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(output_dir, "active_labels.json"), "wt", encoding="utf-8") as f:
+        json.dump(
+            {
+                "active_labels": list(interest_labels),
+                "noise_cluster_ids": [int(x) for x in noise_cluster_ids],
+                "updated_at": int(time.time()),
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
     with open(os.path.join(output_dir, "kmeans_k.json"), "wt", encoding="utf-8") as f:
         json.dump(
             {
@@ -610,7 +611,7 @@ def train_tweet_topic_pipeline(
         "noise_cluster_ids": [int(x) for x in noise_cluster_ids],
         "k_min": int(k_lo),
         "k_max": int(k_hi),
-        "interest_labels": list(INTEREST_LABELS),
+        "interest_labels": list(interest_labels),
         "with_static_features": bool(with_static_features),
         "static_feature_names": static_names,
         "embed_dim": int(x_tweets.shape[1]),
@@ -634,8 +635,8 @@ def train_tweet_topic_pipeline(
     with open(os.path.join(output_dir, "train_user_ids.pkl"), "wb") as f:
         pickle.dump(users_ml, f)
 
-    non_noise_vals = {v for v in cluster_label_map.values() if v != NOISE_LABEL}
-    label_cov = len(non_noise_vals) / float(len(INTEREST_LABELS))
+    non_noise_vals = {v for v in cluster_label_map.values() if not _is_noise_label_name(v)}
+    label_cov = len(non_noise_vals) / float(max(1, len(interest_labels)))
     best_sil: Optional[float] = None
     for row in k_search_results:
         if int(row.get("k", -1)) == int(best_k):

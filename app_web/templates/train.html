@@ -4,8 +4,8 @@
 {% block page_title %}聚类并生成画像{% endblock %}
 {% block page_sub %}
 <div class="text-secondary mt-1">
-  <strong>推荐顺序：</strong>① 从抓取结果导出 <code>kmeans_tweets_input.jsonl</code> → ② 轮廓系数选 k 并聚类 → ③ 生成画像；④ 一键②+③；⑤ 可选 AI 簇命名。
-  聚类为单条微博向量：<code>768-d → PCA(64) → L2 → 选 k → KMeans</code>；②③④ 的默认输入在存在步骤① 产物时为 <code>{{ workspace.train_input_default }}</code>，否则为抓取 bundle / unified。
+  单按钮全流程：导出 <code>kmeans_tweets_input.jsonl</code> → 聚类选 k → 生成画像（infer）→ AI 深度命名（DeepSeek）。
+  默认输入：<code>{{ workspace.train_input_default }}</code>（优先步骤①产物，否则抓取 bundle / unified）。
 </div>
 {% endblock %}
 
@@ -16,21 +16,13 @@
       <div class="card-body">
         <form id="train-form">
           <div class="row g-3 mb-3">
-            <div class="col-12">
-              <div class="fw-medium mb-2">步骤① · 导出 KMeans 输入（数据清洗）</div>
-            </div>
             <div class="col-12 col-md-7">
-              <label class="form-label small text-secondary mb-0">原始抓取（bundle 或 unified jsonl）</label>
+              <label class="form-label small text-secondary mb-0">原始抓取输入（bundle 或 unified jsonl）</label>
               <input type="text" name="prep_source_file" class="form-control font-monospace small" value="{{ workspace.prep_source_default }}" placeholder="output/weibo_crawl_latest.json">
             </div>
             <div class="col-6 col-md-2">
               <label class="form-label small text-secondary mb-0">单条最短字符</label>
               <input name="prep_min_tweet_chars" type="number" class="form-control" value="5" min="1">
-            </div>
-            <div class="col-12 col-md-3 d-flex align-items-end">
-              <button type="button" id="btn-kmeans-prep" class="btn btn-outline-primary w-100">
-                <i class="ti ti-database-import me-1"></i> ① 导出 kmeans_tweets_input.jsonl
-              </button>
             </div>
             <div class="col-12">
               <div class="text-secondary small">写出固定路径 <code>{{ workspace.kmeans_tweets_input.path }}</code>
@@ -39,12 +31,7 @@
             </div>
           </div>
 
-          <div class="hr my-3"></div>
-
           <div class="row g-3 mb-4">
-            <div class="col-12">
-              <div class="fw-medium mb-2">步骤②～⑤ · 聚类 / 画像（输入留空则按上表默认）</div>
-            </div>
             <div class="col-6 col-md-3">
               <label class="form-label fw-medium">k_min</label>
               <input name="k_min" type="number" class="form-control" value="8" min="2">
@@ -60,21 +47,10 @@
             </div>
           </div>
           <div class="btn-list flex-wrap mb-3">
-            <button type="button" id="btn-cluster" class="btn btn-primary">
-              <i class="ti ti-flame me-1"></i> ② KMeans 聚类（自动选 k）
+            <button type="button" id="btn-build-all" class="btn btn-primary">
+              <i class="ti ti-sparkles me-1"></i> 生成模型（全流程）
             </button>
-            <button type="button" id="btn-infer" class="btn btn-success">
-              <i class="ti ti-rocket me-1"></i> ③ 生成画像（infer）
-            </button>
-            <button type="button" id="btn-cluster-infer" class="btn btn-warning">
-              <i class="ti ti-sparkles me-1"></i> ④ 一键聚类+生成画像
-            </button>
-            <button type="button" id="btn-cluster-llm" class="btn btn-outline-info">
-              <i class="ti ti-message-chatbot me-1"></i> ⑤ AI 深度命名（DeepSeek）
-            </button>
-            <button type="button" id="btn-cluster-llm-force" class="btn btn-outline-secondary" title="忽略缓存，全部簇重新调用 API">
-              强制重命名
-            </button>
+            <a href="/#cleanup-panel" class="btn btn-outline-danger">清理本地产物</a>
             <a href="/crawl" class="btn btn-outline-secondary">抓取微博</a>
             <a href="/profiles" class="btn btn-outline-primary">查看画像表</a>
           </div>
@@ -103,7 +79,7 @@
       </div>
       <div class="card-body">
         <div id="cluster-preview-empty" class="text-secondary small">
-          尚未生成聚类结果。请先点击② KMeans 聚类。
+          尚未生成聚类结果。请先点击「生成模型（全流程）」。
         </div>
         <div id="cluster-preview-wrap" class="d-none">
           <div class="row g-3">
@@ -159,7 +135,7 @@
   const logsEl = document.getElementById("job-logs");
   let timer = null;
   let reloadOnDone = false;
-  let lastAction = null; // "cluster" | "infer" | "llm_topic" | "prep"
+  let lastAction = null; // "build_all"
 
   function fmtMaybeNumber(v) {
     if (v === null || v === undefined || v === "") return "—";
@@ -278,115 +254,28 @@
     if (data.status === "completed" || data.status === "failed") {
       stopJobPoll();
       if (data.status === "completed") {
-        if (lastAction === "cluster" || lastAction === "llm_topic") {
+        if (lastAction === "build_all") {
           refreshClusterPreview();
         }
-        if (reloadOnDone || lastAction === "prep") setTimeout(() => location.reload(), 800);
+        if (reloadOnDone || lastAction === "build_all") setTimeout(() => location.reload(), 800);
       }
     }
   }
 
-  document.getElementById("btn-kmeans-prep").addEventListener("click", () => {
+  document.getElementById("btn-build-all").addEventListener("click", () => {
     const fd = new FormData();
     fd.append("source_file", form.querySelector('input[name="prep_source_file"]').value || "");
     fd.append("min_tweet_chars", form.querySelector('input[name="prep_min_tweet_chars"]').value || "5");
-    lastAction = "prep";
-    reloadOnDone = false;
-    statusEl.textContent = "状态: submitting...";
-    logsEl.textContent = "";
-    setJobProgress({ status: "queued", progress: 0, progress_label: "提交步骤① …" });
-    fetch("/api/kmeans_prep", { method: "POST", body: fd }).then(async (resp) => {
-      const data = await resp.json();
-      if (!resp.ok) {
-        statusEl.textContent = `状态: failed | ${data.error || "submit failed"}`;
-        return;
-      }
-      statusEl.textContent = `状态: queued | job=${data.job_id}`;
-      stopJobPoll();
-      timer = setInterval(() => pollJob(data.job_id), 1500);
-      pollJob(data.job_id);
-    });
-  });
-
-  document.getElementById("btn-cluster").addEventListener("click", () => {
-    const fd = new FormData();
     fd.append("input_file", form.querySelector('input[name="input_file"]').value || "");
     fd.append("k_min", form.querySelector('input[name="k_min"]').value || "8");
     fd.append("k_max", form.querySelector('input[name="k_max"]').value || "15");
-    lastAction = "cluster";
-    reloadOnDone = false;
-    statusEl.textContent = "状态: submitting...";
-    logsEl.textContent = "";
-    setJobProgress({ status: "queued", progress: 0, progress_label: "提交聚类任务…" });
-    fetch("/api/cluster_text2vec", { method: "POST", body: fd }).then(async (resp) => {
-      const data = await resp.json();
-      if (!resp.ok) {
-        statusEl.textContent = `状态: failed | ${data.error || "submit failed"}`;
-        return;
-      }
-      statusEl.textContent = `状态: queued | job=${data.job_id}`;
-      stopJobPoll();
-      timer = setInterval(() => pollJob(data.job_id), 1500);
-      pollJob(data.job_id);
-    });
-  });
-
-  document.getElementById("btn-infer").addEventListener("click", () => {
-    const fd = new FormData();
-    fd.append("input_file", form.querySelector('input[name="input_file"]').value || "");
-    lastAction = "infer";
+    fd.append("llm_force", "0");
+    lastAction = "build_all";
     reloadOnDone = true;
     statusEl.textContent = "状态: submitting...";
     logsEl.textContent = "";
-    setJobProgress({ status: "queued", progress: 0, progress_label: "提交生成画像任务…" });
-    fetch("/api/infer_text2vec", { method: "POST", body: fd }).then(async (resp) => {
-      const data = await resp.json();
-      if (!resp.ok) {
-        statusEl.textContent = `状态: failed | ${data.error || "submit failed"}`;
-        return;
-      }
-      statusEl.textContent = `状态: queued | job=${data.job_id}`;
-      stopJobPoll();
-      timer = setInterval(() => pollJob(data.job_id), 1500);
-      pollJob(data.job_id);
-    });
-  });
-
-  function submitTweetClusterLlm(force) {
-    const fd = new FormData();
-    fd.append("force", force ? "1" : "0");
-    lastAction = "llm_topic";
-    reloadOnDone = false;
-    statusEl.textContent = "状态: submitting...";
-    logsEl.textContent = "";
-    setJobProgress({ status: "queued", progress: 0, progress_label: "提交 AI 深度命名…" });
-    fetch("/api/tweet_cluster_llm/run", { method: "POST", body: fd }).then(async (resp) => {
-      const data = await resp.json();
-      if (!resp.ok) {
-        statusEl.textContent = `状态: failed | ${data.detail || data.error || "submit failed"}`;
-        return;
-      }
-      statusEl.textContent = `状态: queued | job=${data.job_id}`;
-      stopJobPoll();
-      timer = setInterval(() => pollJob(data.job_id), 1500);
-      pollJob(data.job_id);
-    });
-  }
-
-  document.getElementById("btn-cluster-llm").addEventListener("click", () => submitTweetClusterLlm(false));
-  document.getElementById("btn-cluster-llm-force").addEventListener("click", () => submitTweetClusterLlm(true));
-
-  document.getElementById("btn-cluster-infer").addEventListener("click", () => {
-    const fd = new FormData();
-    fd.append("input_file", form.querySelector('input[name="input_file"]').value || "");
-    fd.append("k_min", form.querySelector('input[name="k_min"]').value || "8");
-    fd.append("k_max", form.querySelector('input[name="k_max"]').value || "15");
-    lastAction = "cluster";
-    reloadOnDone = false;
-    statusEl.textContent = "状态: submitting...";
-    logsEl.textContent = "";
-    setJobProgress({ status: "queued", progress: 0, progress_label: "提交一键任务…" });
-    fetch("/api/cluster_and_infer_text2vec", { method: "POST", body: fd }).then(async (resp) => {
+    setJobProgress({ status: "queued", progress: 0, progress_label: "提交全流程任务…" });
+    fetch("/api/build_model_all", { method: "POST", body: fd }).then(async (resp) => {
       const data = await resp.json();
       if (!resp.ok) {
         statusEl.textContent = `状态: failed | ${data.error || "submit failed"}`;

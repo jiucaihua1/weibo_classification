@@ -16,7 +16,6 @@ from app_pipeline.feature_tweet_embeddings import (
     static_features_for_users,
 )
 from app_pipeline.preprocess import clean_text
-from app_pipeline.train import INTEREST_LABELS
 from app_pipeline.train_tweet_topic import TweetMultilabelGBDT
 
 
@@ -129,6 +128,29 @@ def _load_cluster_llm_topic(model_dir: str) -> Dict[int, Dict[str, str]]:
     return out
 
 
+def _load_active_labels(model_dir: str, fallback: List[str]) -> List[str]:
+    p = os.path.join(model_dir, "active_labels.json")
+    if not os.path.isfile(p):
+        return list(fallback)
+    try:
+        with open(p, "rt", encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+    except Exception:
+        return list(fallback)
+    raw = data.get("active_labels") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return list(fallback)
+    out: List[str] = []
+    seen: set[str] = set()
+    for x in raw:
+        s = str(x or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out or list(fallback)
+
+
 def infer_tweet_topic_multilabel(
     unified_path: str,
     model_dir: str,
@@ -159,7 +181,7 @@ def infer_tweet_topic_multilabel(
         else:
             clf = gbdt_raw
 
-    interest_labels = list(meta.get("interest_labels") or INTEREST_LABELS)
+    interest_labels = _load_active_labels(model_dir, list(meta.get("interest_labels") or []))
     noise_cids = set()
     for x in meta.get("noise_cluster_ids") or []:
         try:

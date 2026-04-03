@@ -247,6 +247,8 @@ Web 启动：
 - `--retry-times`（默认 2）
 - `--seed`（默认 42）
 - `--append-user-ids`（flag；追加 user_ids，而不是覆盖）
+- `--merge-after`（可选）：抓取结束后把**本次新增的** `output/unified_*.jsonl` 合并成 `output/weibo_crawl_latest.json`
+- `--merge-output`（可选）：合并输出路径（默认 `output/weibo_crawl_latest.json`）
 
 ### 8.2 其它脚本
 

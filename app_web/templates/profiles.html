@@ -40,7 +40,7 @@
                   <div class="uid-sub">{{ p.user_id }}{% if u.followers_count is not none %} · 粉丝 {{ u.followers_count }}{% endif %}</div>
                 </td>
                 <td>
-                  <span class="badge bg-secondary-lt">{{ p.top_interest }}</span>
+                  <span class="badge bg-secondary-lt">{{ p.top_interest_live or p.top_interest }}</span>
                   {% if p.gbdt_top_interest %}
                     <div class="small text-secondary mt-1">粗分：{{ p.gbdt_top_interest }}</div>
                   {% endif %}

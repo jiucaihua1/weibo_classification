@@ -1,28 +1,122 @@
 {% extends "layout.html" %}
 {% block title %}个人兴趣预测 · 微博兴趣看板{% endblock %}
-{% block page_pretitle %}即将上线{% endblock %}
+{% block page_pretitle %}单用户即时推断{% endblock %}
 {% block page_title %}个人兴趣预测{% endblock %}
 {% block page_sub %}
 <div class="text-secondary mt-1">
-  本页为功能占位。上线后计划：输入单个用户 → 抓取其微博正文 → 用已训练的<strong>话题聚类模型</strong>与 <strong>GBDT</strong> 输出兴趣分类与解释。
+  输入单个 UID，直接读取本地抓取数据并调用当前 <code>output/ml_artifacts</code> 模型做即时推断（动态标签维度）。
 </div>
 {% endblock %}
 
 {% block content %}
 <div class="row row-cards">
-  <div class="col-12 col-lg-8">
+  <div class="col-12 col-lg-9">
     <div class="card">
+      <div class="card-header"><h3 class="card-title">输入 UID</h3></div>
       <div class="card-body">
-        <div class="empty">
-          <div class="empty-icon"><i class="ti ti-hourglass-empty text-secondary" style="font-size:2.5rem"></i></div>
-          <p class="empty-title">功能开发中</p>
-          <p class="empty-subtitle text-secondary">
-            暂无表单与接口。当前批量用户流程请使用左侧「关键词抓取 → 抓取微博 → 训练 / 画像」。
-          </p>
-          <div class="empty-action">
-            <a href="/" class="btn btn-outline-primary">返回总览</a>
+        <form method="get" action="/personal-interest" class="row g-3">
+          <div class="col-12 col-md-8">
+            <label class="form-label">用户 UID</label>
+            <input type="text" class="form-control font-monospace" name="user_id" value="{{ query_uid or '' }}" placeholder="例如 1644948230">
+          </div>
+          <div class="col-12 col-md-4 d-flex align-items-end">
+            <button type="submit" class="btn btn-primary w-100">开始预测</button>
+          </div>
+        </form>
+        <div class="text-secondary small mt-3">
+          依赖本地已训练模型与该 UID 的本地微博正文。若缺少模型，请先到「训练 / 画像」执行全流程。
+        </div>
+      </div>
+    </div>
+
+    {% if predict_error %}
+    <div class="card mt-3 border-danger">
+      <div class="card-body text-danger">{{ predict_error }}</div>
+    </div>
+    {% endif %}
+
+    {% if predict_profile %}
+    <div class="card mt-3">
+      <div class="card-header d-flex align-items-center gap-2">
+        <h3 class="card-title mb-0">预测结果</h3>
+        <span class="badge bg-blue-lt">UID {{ predict_profile.user_id }}</span>
+        <span class="badge bg-secondary-lt">样本 {{ predict_profile.sample_size }}</span>
+      </div>
+      <div class="card-body">
+        <div class="mb-3">
+          <div class="text-secondary small">主话题</div>
+          <div class="h3 mb-0">{{ predict_profile.top_interest }}</div>
+          {% if predict_profile.gbdt_top_interest %}
+          <div class="small text-secondary mt-1">GBDT 粗分：{{ predict_profile.gbdt_top_interest }}</div>
+          {% endif %}
+          {% if user_info.nick_name %}
+          <div class="small text-secondary mt-1">{{ user_info.nick_name }}</div>
+          {% endif %}
+        </div>
+
+        {% set labels = active_labels or [] %}
+        {% set scores = predict_profile.interest_scores or {} %}
+        {% if labels %}
+        <div class="mb-3">
+          <div class="text-secondary small mb-2">动态标签分数</div>
+          <div class="table-responsive">
+            <table class="table table-sm table-striped">
+              <thead><tr><th>标签</th><th class="text-end">分数</th></tr></thead>
+              <tbody>
+                {% for lab in labels %}
+                <tr>
+                  <td>{{ lab }}</td>
+                  <td class="text-end">{{ "%.4f"|format(scores.get(lab, 0.0)) }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
           </div>
         </div>
+        {% endif %}
+
+        {% if predict_profile.topic_interest_narratives %}
+        <div class="mb-3">
+          <div class="text-secondary small mb-2">话题关注叙事</div>
+          <ul class="mb-0">
+            {% for line in predict_profile.topic_interest_narratives %}
+            <li>{{ line }}</li>
+            {% endfor %}
+          </ul>
+        </div>
+        {% endif %}
+
+        {% if predict_profile.evidence %}
+        <div>
+          <div class="text-secondary small mb-2">正文证据（前 20 条）</div>
+          <ul class="mb-0">
+            {% for ev in predict_profile.evidence %}
+            <li class="mb-2">
+              <span class="badge bg-secondary-lt">{{ ev.topic_hint }}</span>
+              {{ ev.text }}
+            </li>
+            {% endfor %}
+          </ul>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="col-12 col-lg-3">
+    <div class="card">
+      <div class="card-header"><h3 class="card-title">当前标签维度</h3></div>
+      <div class="card-body">
+        {% if active_labels %}
+          <div class="d-flex flex-wrap gap-1">
+            {% for lab in active_labels %}
+              <span class="badge bg-secondary-lt">{{ lab }}</span>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div class="text-secondary small">尚未读取到 <code>active_labels.json</code>。</div>
+        {% endif %}
       </div>
     </div>
   </div>
