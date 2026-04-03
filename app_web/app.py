@@ -197,15 +197,26 @@ def load_cluster_llm_topic_by_label() -> dict:
 
 def load_active_labels() -> list[str]:
     """读取动态标签维度（由训练期写入 ml_artifacts/active_labels.json）。"""
-    p = os.path.join(OUTPUT_DIR, "ml_artifacts", "active_labels.json")
-    if not os.path.isfile(p):
-        return []
-    try:
-        with open(p, "rt", encoding="utf-8", errors="replace") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return []
-    raw = data.get("active_labels") if isinstance(data, dict) else None
+    model_dir = os.path.join(OUTPUT_DIR, "ml_artifacts")
+    p = os.path.join(model_dir, "active_labels.json")
+    raw = None
+    if os.path.isfile(p):
+        try:
+            with open(p, "rt", encoding="utf-8", errors="replace") as f:
+                data = json.load(f)
+            raw = data.get("active_labels") if isinstance(data, dict) else None
+        except (OSError, json.JSONDecodeError):
+            raw = None
+    # 兼容旧产物：若 active_labels.json 不存在，则回退 training_pipeline.json 里的 interest_labels
+    if not isinstance(raw, list):
+        meta_path = os.path.join(model_dir, "training_pipeline.json")
+        if os.path.isfile(meta_path):
+            try:
+                with open(meta_path, "rt", encoding="utf-8", errors="replace") as f:
+                    meta = json.load(f)
+                raw = meta.get("interest_labels") if isinstance(meta, dict) else None
+            except (OSError, json.JSONDecodeError):
+                raw = None
     if not isinstance(raw, list):
         return []
     out: list[str] = []
@@ -217,6 +228,89 @@ def load_active_labels() -> list[str]:
         seen.add(s)
         out.append(s)
     return out
+
+
+def _try_quick_fetch_uid_posts(uid: str, *, wait_seconds: float = 5.0) -> tuple[bool, str]:
+    """
+    当本地无该 UID 微博时，短时触发一次 tweet_by_user_id 抓取并合并产物。
+    仅等待 wait_seconds 秒，超时后终止进程，再走本地文件重试。
+    """
+    uid_key = normalize_uid(uid)
+    if not uid_key:
+        return False, "UID 无效"
+
+    if not os.path.isfile(COOKIE_PATH):
+        return False, f"未找到 Cookie 文件：{COOKIE_PATH}"
+    try:
+        with open(COOKIE_PATH, "rt", encoding="utf-8", errors="replace") as f:
+            cookie = f.read().strip()
+    except OSError:
+        return False, "读取 Cookie 文件失败"
+    if not cookie:
+        return False, "Cookie 为空，请先在抓取页配置 Cookie"
+
+    env = os.environ.copy()
+    env["WEIBO_USER_IDS"] = uid_key
+    env["WEIBO_CRAWL_TIME_SPAN"] = "false"
+    env["WEIBO_MAX_PAGES"] = "5"
+    env["WEIBO_DOWNLOAD_DELAY"] = "1.0"
+    env["WEIBO_CONCURRENT_REQUESTS"] = "2"
+    env["WEIBO_RETRY_TIMES"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
+
+    # 确保 spider 读取到 cookie 文件
+    try:
+        with open(COOKIE_PATH, "wt", encoding="utf-8") as f:
+            f.write(cookie)
+    except OSError:
+        return False, "写入 Cookie 文件失败"
+
+    cmd = [PYTHON_BIN, "run_spider.py", "tweet_by_user_id"]
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=WEIBO_DIR,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        start = time.time()
+        while True:
+            if proc.poll() is not None:
+                break
+            if (time.time() - start) >= float(wait_seconds):
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+                break
+            time.sleep(0.15)
+        try:
+            proc.wait(timeout=2.0)
+        except Exception:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+    except Exception as exc:
+        return False, f"短抓取启动失败: {exc}"
+
+    try:
+        from app_pipeline.merge_unified_to_bundle import merge_paths
+
+        u_paths = glob.glob(os.path.join(OUTPUT_DIR, "unified_*.jsonl"))
+        if not u_paths:
+            return False, "短抓取后未发现 unified_*.jsonl"
+        u_paths = sorted(u_paths, key=os.path.getmtime)
+        payload, _n_in, _n_dup = merge_paths(u_paths)
+        write_crawl_bundle(OUTPUT_DIR, f"quick-{uid_key}", payload)
+    except Exception as exc:
+        return False, f"短抓取后合并失败: {exc}"
+    return True, "ok"
 
 
 def _predict_personal_interest_from_local(uid: str) -> dict:
@@ -248,7 +342,11 @@ def _predict_personal_interest_from_local(uid: str) -> dict:
 
     posts, _files_hit = load_user_weibo_posts(uid_key, OUTPUT_DIR, limit=300)
     if not posts:
-        raise RuntimeError("本地未找到该 UID 的原始微博，请先抓取并确认 unified/bundle 内存在该 UID。")
+        ok, _msg = _try_quick_fetch_uid_posts(uid_key, wait_seconds=5.0)
+        if ok:
+            posts, _files_hit = load_user_weibo_posts(uid_key, OUTPUT_DIR, limit=300)
+    if not posts:
+        raise RuntimeError("本地未找到该 UID 微博；已尝试自动短抓取 5 秒，仍无可用数据。")
 
     rows = []
     for p in posts:
