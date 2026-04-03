@@ -10,8 +10,22 @@
         <h2 class="page-title">{{ user_info.nick_name or profile.user_id }}</h2>
         <div class="text-secondary font-monospace">{{ profile.user_id }}</div>
       </div>
-      <div class="col-auto ms-auto">
-        <span class="badge bg-azure-lt">{{ profile.top_interest }}</span>
+      <div class="col-auto ms-auto d-flex flex-wrap gap-1 align-items-center justify-content-end">
+        {% set cdn = cluster_display_names or {} %}
+        {% if kmeans_ml %}
+          {% set pk = kmeans_ml.primary|string %}
+          {% set pn = cdn.get(pk, '') %}
+          <span class="badge bg-blue-lt" title="簇 {{ kmeans_ml.primary }}{% if cluster_keyword_summaries.get(pk) %} · {{ cluster_keyword_summaries.get(pk)|e }}{% endif %}">{% if pn %}{{ pn }}{% else %}主簇 {{ kmeans_ml.primary }}{% endif %}</span>
+          {% if kmeans_ml.secondary %}
+            {% for c in kmeans_ml.secondary %}
+              {% set sk = c|string %}
+              {% set sn = cdn.get(sk, '') %}
+              <span class="badge bg-azure-lt" title="簇 {{ c }}{% if cluster_keyword_summaries.get(sk) %} · {{ cluster_keyword_summaries.get(sk)|e }}{% endif %}">{% if sn %}{{ sn }}{% else %}次簇 {{ c }}{% endif %}</span>
+            {% endfor %}
+          {% endif %}
+        {% endif %}
+        <span class="badge bg-secondary-lt">标签 {{ profile.top_interest }}</span>
+        <a href="/users/{{ profile.user_id }}/weibo-sources" class="btn btn-sm btn-outline-secondary">原始微博</a>
       </div>
     </div>
   </div>
@@ -40,7 +54,44 @@
     <div class="card">
       <div class="card-header"><h3 class="card-title">模型输出</h3></div>
       <div class="card-body">
-        <div class="mb-2 d-flex justify-content-between"><span class="text-secondary">聚类 ID</span><span class="font-monospace">{{ profile.cluster_id }}</span></div>
+        {% if kmeans_ml %}
+          {% set cdn2 = cluster_display_names or {} %}
+          <div class="mb-2 d-flex justify-content-between align-items-start gap-2">
+            <span class="text-secondary">KMeans 多标签</span>
+            <span class="text-end">
+              {% set pk2 = kmeans_ml.primary|string %}
+              {% set pn2 = cdn2.get(pk2, '') %}
+              <span class="badge bg-blue-lt" title="簇 {{ kmeans_ml.primary }}">{% if pn2 %}{{ pn2 }}{% else %}主 {{ kmeans_ml.primary }}{% endif %}</span>
+              {% if kmeans_ml.secondary %}{% for c in kmeans_ml.secondary %}{% set sk2 = c|string %}{% set sn2 = cdn2.get(sk2, '') %}<span class="badge bg-azure-lt ms-1" title="簇 {{ c }}">{% if sn2 %}{{ sn2 }}{% else %}次 {{ c }}{% endif %}</span>{% endfor %}{% endif %}
+            </span>
+          </div>
+          {% set pk = kmeans_ml.primary|string %}
+          {% if cluster_keywords.get(pk) %}
+            <div class="text-secondary small mb-1">主簇关键词</div>
+            <div class="small mb-3">{{ cluster_keywords.get(pk) | join('、') }}</div>
+          {% elif cluster_keyword_summaries.get(pk) %}
+            <div class="small text-secondary mb-3">{{ cluster_keyword_summaries.get(pk) }}</div>
+          {% endif %}
+          {% if kmeans_ml.secondary %}
+            {% for c in kmeans_ml.secondary %}
+              {% set sk = c|string %}
+              {% if cluster_keywords.get(sk) %}
+                {% set snm = cdn2.get(sk, '') %}
+                <div class="text-secondary small mb-1">次簇{% if snm %}（{{ snm }}）{% else %} {{ c }}{% endif %} 关键词</div>
+                <div class="small mb-2">{{ cluster_keywords.get(sk) | join('、') }}</div>
+              {% endif %}
+            {% endfor %}
+          {% endif %}
+          <div class="mb-2 d-flex justify-content-between"><span class="text-secondary">阈值内最小距离</span><span class="font-monospace small">{{ "%.4f"|format(kmeans_ml.min_distance) if kmeans_ml.min_distance is not none else "—" }}</span></div>
+          <div class="mb-2 d-flex justify-content-between"><span class="text-secondary">距离阈值</span><span class="font-monospace small">{{ "%.4f"|format(kmeans_ml.threshold) if kmeans_ml.threshold is not none else "—" }}</span></div>
+          {% if kmeans_ml.distances_to_centroids %}
+            <div class="text-secondary small mb-1">到各质心距离</div>
+            <div class="font-monospace small mb-3">{% for d in kmeans_ml.distances_to_centroids %}{{ "%.4f"|format(d) }}{% if not loop.last %}, {% endif %}{% endfor %}</div>
+          {% endif %}
+        {% else %}
+          <div class="text-secondary small mb-2">暂无多标签结果（请运行 <code>kmeans_multilabel</code> 并生成 jsonl）。</div>
+        {% endif %}
+        <div class="mb-2 d-flex justify-content-between"><span class="text-secondary">推断聚类 ID</span><span class="font-monospace">{{ profile.cluster_id }}</span></div>
         <div class="mb-2 d-flex justify-content-between"><span class="text-secondary">样本数</span><span>{{ profile.sample_size }}</span></div>
         <div class="text-secondary small">来源统计</div>
         <div class="small">{{ profile.source_stats }}</div>

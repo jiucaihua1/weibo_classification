@@ -28,6 +28,18 @@
   </div>
   <div class="col-sm-6 col-lg-3">
     <div class="card">
+      <div class="card-body d-flex flex-column">
+        <div class="subheader">KMeans 多标签</div>
+        <div class="h1 mb-0">{{ kmeans_multilabel_count }}</div>
+        <div class="text-secondary small mt-1">
+          <a href="/kmeans-multilabel">查看表格</a>
+          {% if workspace.kmeans_multilabel.exists %}<span class="text-success">· 已有文件</span>{% endif %}
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-lg-3">
+    <div class="card">
       <div class="card-body">
         <div class="subheader">热搜 UID 文件</div>
         <div class="h1 mb-0">{{ workspace.hot_uid_count }}</div>

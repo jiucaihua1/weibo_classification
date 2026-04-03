@@ -15,13 +15,25 @@ from fastapi.templating import Jinja2Templates
 
 from app_web.crawl_bundle import build_crawl_bundle, cleanup_post_crawl_artifacts, write_crawl_bundle
 from app_web.output_cleanup import cleanup_output_full, cleanup_output_selective
-from app_web.workspace import get_workspace_state
+from app_web.weibo_sources_service import load_user_weibo_posts
+from app_web.workspace import (
+    get_workspace_state,
+    multilabel_data_source_rows,
+    rel_posix,
+)
 from app_web.hot_search_service import (
     get_hot_search_speed_profile as service_get_hot_search_speed_profile,
     latest_hot_search_debug_file as service_latest_hot_search_debug_file,
     run_hot_search_sample_job as service_run_hot_search_sample_job,
 )
 from app_pipeline.clean_user_text import CleanConfig, clean_bundle_users_to_jsonl
+from app_pipeline.cluster_llm_labels import (
+    generate_cluster_llm_labels,
+    merge_llm_labels_into_meta,
+    multilabel_jsonl_fingerprint,
+    resolve_deepseek_api_key,
+    try_load_cached_cluster_llm,
+)
 from app_pipeline.step1_bert_features import extract_user_features_from_cleaned_jsonl
 
 TEXT2VEC_MODEL_NAME = "shibing624/text2vec-base-chinese"
@@ -40,6 +52,8 @@ OUTPUT_DIR = os.path.join(PROJECT_DIR, "output")
 HOT_SUMMARY_LATEST_PATH = os.path.join(OUTPUT_DIR, "hot_search_keyword_user_summary_latest.json")
 WEIBO_CRAWL_LATEST_JSON = os.path.join(OUTPUT_DIR, "weibo_crawl_latest.json")
 CLEANED_USER_TEXTS_JSONL = os.path.join(OUTPUT_DIR, "cleaned_user_texts.jsonl")
+KMEANS_MULTILABEL_JSONL = os.path.join(OUTPUT_DIR, "kmeans_multilabel_users.jsonl")
+KMEANS_MULTILABEL_META = os.path.join(OUTPUT_DIR, "kmeans_multilabel_meta.json")
 
 app = FastAPI(title="Weibo Interest Dashboard", version="0.2.0")
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
@@ -49,7 +63,7 @@ jobs_lock = threading.Lock()
 
 def _page_context(request: Request, nav_active: str, **extra):
     ws = get_workspace_state(PROJECT_DIR, OUTPUT_DIR, COOKIE_PATH, PROFILE_PATH, WEIBO_CRAWL_LATEST_JSON)
-    ws["profiles_count"] = len(load_profiles())
+    ws["profiles_count"] = len(load_profiles_effective())
     ctx = {"request": request, "nav_active": nav_active, "workspace": ws}
     ctx.update(extra)
     return ctx
@@ -72,6 +86,117 @@ def load_user_infos() -> dict:
         return {}
     with open(USER_INFO_PATH, "rt", encoding="utf-8", errors="replace") as f:
         return json.load(f)
+
+
+def load_kmeans_multilabel() -> list:
+    if not os.path.isfile(KMEANS_MULTILABEL_JSONL):
+        return []
+    rows = []
+    with open(KMEANS_MULTILABEL_JSONL, "rt", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def load_kmeans_multilabel_meta() -> dict:
+    if not os.path.isfile(KMEANS_MULTILABEL_META):
+        return {}
+    with open(KMEANS_MULTILABEL_META, "rt", encoding="utf-8", errors="replace") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return {}
+
+
+def _cluster_display_names(meta: dict) -> dict[str, str]:
+    """优先 DeepSeek 生成的 cluster_llm_labels；否则词典 cluster_display_names；再否则由关键词现场匹配抽屉。"""
+    llm = meta.get("cluster_llm_labels")
+    if isinstance(llm, dict) and llm:
+        return {str(k): str(v) for k, v in llm.items()}
+    raw = meta.get("cluster_display_names")
+    if isinstance(raw, dict) and raw:
+        return {str(k): str(v) for k, v in raw.items()}
+    kw = meta.get("cluster_keywords")
+    if isinstance(kw, dict) and kw:
+        from app_pipeline.cluster_category_names import map_cluster_keywords_to_names
+
+        return map_cluster_keywords_to_names(kw)
+    return {}
+
+
+def _kmeans_multilabel_by_user() -> dict:
+    out: dict = {}
+    for row in load_kmeans_multilabel():
+        uid = str(row.get("user_id", "")).strip()
+        if uid:
+            out[uid] = row
+    return out
+
+
+def _kmeans_ml_view(row: dict | None) -> dict | None:
+    """主簇、按距离排序的次簇，供画像表与详情对照来源判断。"""
+    if not row:
+        return None
+    primary = row.get("primary_cluster")
+    all_ids = list(row.get("multilabel_cluster_ids") or [])
+    dists = row.get("distances_to_centroids") or []
+
+    def dist_for(cid):
+        try:
+            i = int(cid)
+            if 0 <= i < len(dists):
+                return float(dists[i])
+        except (TypeError, ValueError):
+            pass
+        return float("inf")
+
+    secondary = [x for x in all_ids if x != primary]
+    secondary_sorted = sorted(secondary, key=dist_for)
+    return {
+        "primary": primary,
+        "secondary": secondary_sorted,
+        "multilabel_all": all_ids,
+        "min_distance": row.get("min_distance"),
+        "threshold": row.get("threshold"),
+        "distances_to_centroids": dists,
+    }
+
+
+def _synthetic_profile_from_multilabel_row(row: dict) -> dict:
+    """多标签 jsonl 一行 → 与推断画像字段对齐的占位记录（无推断时用）。"""
+    uid = str(row.get("user_id", "")).strip()
+    ml = _kmeans_ml_view(row)
+    prim = ml["primary"] if ml else row.get("primary_cluster")
+    label = f"簇{prim}" if prim is not None else "—"
+    return {
+        "user_id": uid,
+        "top_interest": label,
+        "sample_size": "—",
+        "source_stats": "仅 KMeans 多标签（未跑推断画像）",
+        "cluster_id": prim,
+        "interest_scores": "（未生成）",
+        "evidence": [],
+    }
+
+
+def load_profiles_effective() -> list:
+    """优先读取 user_interest_profiles.json；若文件不存在或列表为空，则用 kmeans_multilabel_users.jsonl 生成列表。"""
+    raw = load_profiles()
+    if raw:
+        return raw
+    out = []
+    for row in load_kmeans_multilabel():
+        uid = str(row.get("user_id", "")).strip()
+        if not uid:
+            continue
+        out.append(_synthetic_profile_from_multilabel_row(row))
+    return out
 
 
 def _list_unified_files() -> set[str]:
@@ -647,6 +772,148 @@ def _cluster_and_infer_text2vec_job(job_id: str, input_path: str, k_min: int, k_
         _append_job_log(job_id, f"Failed: {exc}")
 
 
+def _cluster_llm_labels_status() -> dict:
+    """多标签页展示：缓存是否命中、是否已配置 Key 等。"""
+    meta = load_kmeans_multilabel_meta()
+    model_s = (os.environ.get("DEEPSEEK_MODEL", "") or "deepseek-chat").strip()
+    key_ok = bool(resolve_deepseek_api_key(""))
+    if not os.path.isfile(KMEANS_MULTILABEL_JSONL):
+        return {
+            "has_jsonl": False,
+            "cache_hit": False,
+            "key_configured": key_ok,
+            "model": model_s,
+            "message": "尚无 kmeans_multilabel_users.jsonl",
+        }
+    fp = multilabel_jsonl_fingerprint(KMEANS_MULTILABEL_JSONL)
+    labels = meta.get("cluster_llm_labels") if isinstance(meta.get("cluster_llm_labels"), dict) else {}
+    fp_meta = meta.get("cluster_llm_source_fingerprint")
+    model_meta = meta.get("cluster_llm_model") or ""
+    cache_hit = bool(labels) and fp_meta == fp and (model_meta or "deepseek-chat") == model_s
+    return {
+        "has_jsonl": True,
+        "cache_hit": cache_hit,
+        "has_llm_labels": bool(labels),
+        "key_configured": key_ok,
+        "model": model_s,
+        "labels": labels,
+        "fingerprint_short": fp[:12] + "…",
+    }
+
+
+def _cluster_llm_labels_job(job_id: str, force: bool) -> None:
+    def _done_ts() -> str:
+        return datetime.now().isoformat(timespec="seconds")
+
+    try:
+        _update_job(job_id, progress=2, progress_label="准备…")
+        model_s = (os.environ.get("DEEPSEEK_MODEL", "") or "deepseek-chat").strip()
+        base_url = (os.environ.get("DEEPSEEK_BASE_URL", "") or "https://api.deepseek.com").strip()
+
+        if not os.path.isfile(KMEANS_MULTILABEL_JSONL):
+            _update_job(
+                job_id,
+                status="failed",
+                error="未找到 kmeans_multilabel_users.jsonl",
+                completed_at=_done_ts(),
+                progress_label="失败",
+            )
+            return
+
+        fp = multilabel_jsonl_fingerprint(KMEANS_MULTILABEL_JSONL)
+        _update_job(job_id, progress=8, progress_label="检查聚类是否变化…")
+
+        if not force:
+            cached_frag = try_load_cached_cluster_llm(KMEANS_MULTILABEL_META, fp, model_s)
+            if cached_frag is not None:
+                _append_job_log(job_id, "多标签文件与 meta 指纹一致，沿用已保存标签，未调用 DeepSeek。")
+                _update_job(
+                    job_id,
+                    status="completed",
+                    progress=100,
+                    progress_label="已缓存（未调用 API）",
+                    completed_at=_done_ts(),
+                    result={"cached": True, "cluster_llm_labels": cached_frag["cluster_llm_labels"]},
+                )
+                return
+
+        api_key = resolve_deepseek_api_key("")
+        if not api_key:
+            _update_job(
+                job_id,
+                status="failed",
+                error="未配置 DeepSeek：请创建项目根目录 deepseek_api_key.txt 或设置 DEEPSEEK_API_KEY",
+                completed_at=_done_ts(),
+                progress_label="失败",
+            )
+            return
+
+        user_ids: list = []
+        primaries: list[int] = []
+        with open(KMEANS_MULTILABEL_JSONL, "rt", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                user_ids.append(row.get("user_id"))
+                primaries.append(int(row.get("primary_cluster", 0)))
+
+        n_clusters = max(primaries) + 1 if primaries else 0
+        if n_clusters <= 0:
+            _update_job(
+                job_id,
+                status="failed",
+                error="无法解析簇数",
+                completed_at=_done_ts(),
+                progress_label="失败",
+            )
+            return
+
+        _append_job_log(job_id, f"调用 DeepSeek，K={n_clusters}，模型={model_s}")
+        _update_job(job_id, progress=15, progress_label="DeepSeek 生成各簇四字标签…")
+
+        labels = generate_cluster_llm_labels(
+            user_ids,
+            primaries,
+            output_dir=OUTPUT_DIR,
+            n_clusters=n_clusters,
+            api_key=api_key,
+            seed=42,
+            base_url=base_url,
+            model=model_s,
+        )
+        merge_llm_labels_into_meta(
+            KMEANS_MULTILABEL_META,
+            labels,
+            provider="deepseek",
+            model=model_s,
+            base_url=base_url,
+            fingerprint=fp,
+        )
+        _append_job_log(job_id, "已写入 kmeans_multilabel_meta.json（含 cluster_llm_source_fingerprint）")
+        _update_job(
+            job_id,
+            status="completed",
+            progress=100,
+            progress_label="完成",
+            completed_at=_done_ts(),
+            result={"cached": False, "cluster_llm_labels": labels},
+        )
+    except Exception as exc:
+        _append_job_log(job_id, f"失败: {exc}")
+        _update_job(
+            job_id,
+            status="failed",
+            error=str(exc),
+            completed_at=_done_ts(),
+            progress_label="失败",
+        )
+
+
 def _train_pipeline_job(job_id: str, clusters: int, input_path: str):
     try:
         # legacy endpoint: use clusters as k_max
@@ -756,15 +1023,56 @@ def _clean_data_job(job_id: str, input_path: str, min_chars: int):
 
 @app.get("/api/profiles")
 def api_profiles():
-    return load_profiles()
+    return load_profiles_effective()
 
 
 @app.get("/api/profiles/{user_id}")
 def api_profile(user_id: str):
-    for item in load_profiles():
-        if item.get("user_id") == user_id:
+    uid = str(user_id).strip()
+    for item in load_profiles_effective():
+        if str(item.get("user_id", "")).strip() == uid:
             return item
     raise HTTPException(status_code=404, detail="user not found")
+
+
+@app.get("/api/kmeans_multilabel")
+def api_kmeans_multilabel():
+    """KMeans 距离门槛多标签结果（由命令行 `python -m app_pipeline.kmeans_multilabel` 生成）。"""
+    rows = load_kmeans_multilabel()
+    meta = load_kmeans_multilabel_meta()
+    return {"meta": meta, "users": rows, "count": len(rows)}
+
+
+@app.get("/api/kmeans_multilabel/{user_id}")
+def api_kmeans_multilabel_user(user_id: str):
+    for row in load_kmeans_multilabel():
+        if str(row.get("user_id")) == str(user_id):
+            return row
+    raise HTTPException(status_code=404, detail="user not found in kmeans multilabel")
+
+
+@app.get("/api/cluster_llm_labels/status")
+def api_cluster_llm_labels_status():
+    """多标签页用：是否命中缓存、Key 是否就绪。"""
+    return _cluster_llm_labels_status()
+
+
+@app.post("/api/cluster_llm_labels/run")
+def api_cluster_llm_labels_run(force: int = Form(0)):
+    """
+    网页一键生成簇四字标签。
+    若 kmeans_multilabel_users.jsonl 内容与 meta 中 cluster_llm_source_fingerprint 一致，则跳过 API（除非 force=1）。
+    """
+    job_id = str(uuid.uuid4())
+    with jobs_lock:
+        jobs[job_id] = _new_job_record(job_id)
+    thread = threading.Thread(
+        target=_cluster_llm_labels_job,
+        args=(job_id, bool(int(force))),
+        daemon=True,
+    )
+    thread.start()
+    return {"job_id": job_id, "status": "queued"}
 
 
 @app.get("/api/cluster_preview")
@@ -810,7 +1118,7 @@ def api_cluster_preview():
 
 @app.get("/api/stats")
 def api_stats():
-    profiles = load_profiles()
+    profiles = load_profiles_effective()
     counter = Counter([x.get("top_interest", "其他") for x in profiles])
     return {"total_users": len(profiles), "interest_distribution": dict(counter)}
 
@@ -818,7 +1126,7 @@ def api_stats():
 @app.get("/api/workspace")
 def api_workspace():
     ws = get_workspace_state(PROJECT_DIR, OUTPUT_DIR, COOKIE_PATH, PROFILE_PATH, WEIBO_CRAWL_LATEST_JSON)
-    ws["profiles_count"] = len(load_profiles())
+    ws["profiles_count"] = len(load_profiles_effective())
     return {k: v for k, v in ws.items() if k != "default_cookie"}
 
 
@@ -1047,12 +1355,17 @@ def api_cluster_and_infer_text2vec(
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request):
-    profiles = load_profiles()
+    profiles = load_profiles_effective()
     top_counter = Counter([x.get("top_interest", "其他") for x in profiles])
     return templates.TemplateResponse(
         request=request,
         name="dashboard.html",
-        context=_page_context(request, "home", interest_distribution=dict(top_counter)),
+        context=_page_context(
+            request,
+            "home",
+            interest_distribution=dict(top_counter),
+            kmeans_multilabel_count=len(load_kmeans_multilabel()),
+        ),
     )
 
 
@@ -1094,27 +1407,102 @@ def page_clean(request: Request):
 
 @app.get("/profiles", response_class=HTMLResponse)
 def page_profiles(request: Request):
-    profiles = load_profiles()
+    profiles = load_profiles_effective()
     user_infos = load_user_infos()
+    ml_map = _kmeans_multilabel_by_user()
+    for p in profiles:
+        uid = str(p.get("user_id", "")).strip()
+        p["kmeans_ml"] = _kmeans_ml_view(ml_map.get(uid))
+    ml_meta = load_kmeans_multilabel_meta()
+    cluster_keyword_summaries = ml_meta.get("cluster_keyword_summaries") or {}
+    cluster_display_names = _cluster_display_names(ml_meta)
     return templates.TemplateResponse(
         request=request,
         name="profiles.html",
-        context=_page_context(request, "profiles", profiles=profiles, user_infos=user_infos),
+        context=_page_context(
+            request,
+            "profiles",
+            profiles=profiles,
+            user_infos=user_infos,
+            cluster_keyword_summaries=cluster_keyword_summaries,
+            cluster_display_names=cluster_display_names,
+        ),
+    )
+
+
+@app.get("/kmeans-multilabel", response_class=HTMLResponse)
+def page_kmeans_multilabel(request: Request):
+    rows = load_kmeans_multilabel()
+    meta = load_kmeans_multilabel_meta()
+    user_infos = load_user_infos()
+    cluster_display_names = _cluster_display_names(meta)
+    multilabel_data_sources = multilabel_data_source_rows(PROJECT_DIR, OUTPUT_DIR, meta)
+    cluster_llm_ui = _cluster_llm_labels_status()
+    return templates.TemplateResponse(
+        request=request,
+        name="multilabel.html",
+        context=_page_context(
+            request,
+            "multilabel",
+            multilabel_rows=rows,
+            multilabel_meta=meta,
+            user_infos=user_infos,
+            cluster_display_names=cluster_display_names,
+            multilabel_data_sources=multilabel_data_sources,
+            cluster_llm_ui=cluster_llm_ui,
+        ),
+    )
+
+
+@app.get("/users/{user_id}/weibo-sources", response_class=HTMLResponse)
+def page_user_weibo_sources(request: Request, user_id: str):
+    uid_key = str(user_id).strip()
+    posts, files_hit = load_user_weibo_posts(uid_key, OUTPUT_DIR)
+    user_info = load_user_infos().get(uid_key, {})
+    latest_u = latest_unified_file()
+    latest_unified_rel = rel_posix(PROJECT_DIR, latest_u) if latest_u else ""
+    return templates.TemplateResponse(
+        request=request,
+        name="weibo_sources.html",
+        context=_page_context(
+            request,
+            "multilabel",
+            user_id=uid_key,
+            user_info=user_info,
+            weibo_posts=posts,
+            weibo_source_files=files_hit,
+            latest_unified_rel=latest_unified_rel,
+        ),
     )
 
 
 @app.get("/users/{user_id}", response_class=HTMLResponse)
 def user_detail(request: Request, user_id: str):
+    uid_key = str(user_id).strip()
     target = None
-    for item in load_profiles():
-        if item.get("user_id") == user_id:
+    for item in load_profiles_effective():
+        if str(item.get("user_id", "")).strip() == uid_key:
             target = item
             break
     if not target:
         raise HTTPException(status_code=404, detail="user not found")
     user_info = load_user_infos().get(str(user_id), {})
+    kmeans_ml = _kmeans_ml_view(_kmeans_multilabel_by_user().get(str(user_id).strip()))
+    ml_meta = load_kmeans_multilabel_meta()
+    cluster_keyword_summaries = ml_meta.get("cluster_keyword_summaries") or {}
+    cluster_keywords = ml_meta.get("cluster_keywords") or {}
+    cluster_display_names = _cluster_display_names(ml_meta)
     return templates.TemplateResponse(
         request=request,
         name="detail.html",
-        context=_page_context(request, "profiles", profile=target, user_info=user_info),
+        context=_page_context(
+            request,
+            "profiles",
+            profile=target,
+            user_info=user_info,
+            kmeans_ml=kmeans_ml,
+            cluster_keyword_summaries=cluster_keyword_summaries,
+            cluster_keywords=cluster_keywords,
+            cluster_display_names=cluster_display_names,
+        ),
     )

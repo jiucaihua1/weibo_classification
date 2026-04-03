@@ -32,6 +32,9 @@ wheels/
 .installed.cfg
 *.egg
 
+# ========== 本地密钥（勿提交）==========
+deepseek_api_key.txt
+
 # ========== 项目生成的文件 ==========
 data/
 logs/

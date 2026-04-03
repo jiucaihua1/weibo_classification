@@ -3,53 +3,21 @@ import json
 import os
 import pickle
 
-import jieba
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.manifold import TSNE
 
-# 常见中文停用词（可按需扩充）
-_STOP_WORDS = set(
-    ["的", "了", "是", "我", "在", "和", "就", "都", "也", "有", "与", "及", "等", "为", "对", "被","自己","就是"]
-)
+# 与 app_pipeline/cluster_keywords.py 共用同一套 TF-IDF 逻辑
+import sys
 
+_sandbox_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.dirname(_sandbox_dir)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
-def _load_user_texts_from_cleaned_jsonl(path: str) -> dict[str, str]:
-    by_uid: dict[str, str] = {}
-    with open(path, "rt", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            uid = str(obj.get("user_id", "")).strip()
-            text = str(obj.get("cleaned_text", "") or "").strip()
-            if uid and text:
-                by_uid[uid] = text
-    return by_uid
-
-
-def get_top_keywords(text_list: list[str], top_n: int = 10, stop_words: set[str] | None = None) -> list[str]:
-    stop = stop_words if stop_words is not None else _STOP_WORDS
-    words_list: list[str] = []
-    for text in text_list:
-        words = [w for w in jieba.cut(str(text)) if w not in stop and len(w) > 1]
-        words_list.append(" ".join(words))
-    if not words_list or not any(words_list):
-        return []
-    vectorizer = TfidfVectorizer(max_features=1000)
-    tfidf_matrix = vectorizer.fit_transform(words_list)
-    feature_names = vectorizer.get_feature_names_out()
-    sum_tfidf = np.asarray(tfidf_matrix.sum(axis=0)).ravel()
-    words_freq = [(feature_names[i], float(sum_tfidf[i])) for i in range(len(feature_names))]
-    words_freq = sorted(words_freq, key=lambda x: x[1], reverse=True)
-    return [word for word, _ in words_freq[:top_n]]
+from app_pipeline.cluster_keywords import get_top_keywords, load_user_texts_from_cleaned_jsonl as _load_user_texts_from_cleaned_jsonl
 
 
 def main() -> None:
