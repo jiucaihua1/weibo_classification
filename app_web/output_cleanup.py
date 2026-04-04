@@ -1,4 +1,4 @@
-"""Delete subsets of files under output/ by pipeline step."""
+"""Delete subset11s of files under output/ by pipeline step."""
 from __future__ import annotations
 
 import os
