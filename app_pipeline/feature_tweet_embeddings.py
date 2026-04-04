@@ -1,8 +1,21 @@
 """
-Per-tweet sentence embeddings (text2vec / BERT-style) for topic-level K-Means.
+feature_tweet_embeddings.py — 推文级句向量（text2vec / sentence-transformers）
 
-Reuses the same user/tweet filters as feature_bert_textrank (drop 大 V、转发微博等)，
-但不再做 TextRank：对每条有效微博的清洗全文直接 encode，一条微博一个向量。
+作用概述：
+- 为「单条微博 → 一个语义向量」流水线提供特征提取，供 train_tweet_topic（聚类+GBDT）
+  与 infer（推断画像）在训练/推断阶段调用。
+- 从抓取结果 weibo bundle（weibo_crawl_latest.json）或 unified_*.jsonl 中流式读取记录，
+  按统一规则过滤用户与微博（如大 V、转发微博、过短正文等；转发见 tweet_text_normalize.text_is_retweet），
+  不做 TextRank：对清洗后的正文整句直接 encode，一条有效微博对应一行向量（默认 768 维）。
+
+主要入口：
+- extract_tweet_embeddings：输出 (tweet_user_ids, x_tweets, tweet_texts)，供 KMeans/PCA。
+- mean_embedding_by_user：按 user_id 对推文向量求均值，得到用户级表示。
+- static_features_for_users：可选拼接粉丝数、微博数等静态标量特征。
+
+依赖：data_io（读 bundle/unified）、tweet_text_normalize（清洗与转发判断）。模型名/设备由 TweetEmbeddingConfig 配置。
+
+English: Per-tweet sentence embeddings for topic-level K-Means; encode full cleaned text per tweet (no TextRank).
 """
 
 from __future__ import annotations
@@ -13,8 +26,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from app_pipeline.data_io import iter_crawl_bundle_users, iter_unified_jsonl_records
-from app_pipeline.feature_bert_textrank import _text_is_retweet
-from app_pipeline.tweet_text_normalize import clean_tweet_for_encode
+from app_pipeline.tweet_text_normalize import clean_tweet_for_encode, text_is_retweet
 
 
 @dataclass
@@ -39,7 +51,7 @@ def _append_tweet_from_record(
     if rec.get("source_type") != "tweet":
         return False
     text = rec.get("text") or ""
-    if _text_is_retweet(text):
+    if text_is_retweet(text):
         return False
     cleaned = clean_tweet_for_encode(text)
     if len(cleaned) < min_tweet_chars:

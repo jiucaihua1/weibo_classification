@@ -10,8 +10,7 @@ import os
 from typing import Any, Callable, Dict, Optional
 
 from app_pipeline.data_io import iter_crawl_bundle_users, iter_unified_jsonl_records
-from app_pipeline.feature_bert_textrank import _text_is_retweet
-from app_pipeline.tweet_text_normalize import clean_tweet_for_encode
+from app_pipeline.tweet_text_normalize import clean_tweet_for_encode, text_is_retweet
 
 
 def _emit_tweet_line(
@@ -25,7 +24,7 @@ def _emit_tweet_line(
     if rec.get("source_type") != "tweet":
         return None
     text = rec.get("text") or ""
-    if _text_is_retweet(str(text)):
+    if text_is_retweet(str(text)):
         return None
     cleaned = clean_tweet_for_encode(str(text))
     if len(cleaned) < min_tweet_chars:

@@ -9,6 +9,14 @@ from __future__ import annotations
 import re
 
 
+def text_is_retweet(text: str) -> bool:
+    """原创过滤：微博正文仅为「转发微博」或以其开头时视为转发占位，不参与嵌入/聚类。"""
+    if not text:
+        return False
+    t = str(text).strip()
+    return t == "转发微博" or t.startswith("转发微博")
+
+
 def clean_tweet_for_encode(text: str) -> str:
     """
     White-list based cleaning (aligned with train_tweet_topic pipeline):

@@ -22,6 +22,13 @@
 - `weibospider/spiders/*`：具体抓取逻辑（`user`、`tweet_by_user_id`、`tweet_by_keyword` 等）
 - 产出：`output/unified_*.jsonl` 以及用户/微博抓取相关中间产物
 
+#### `multidim_crawl.py` 与 `run_spider.py` 的分工（终端关键词整条链）
+
+- **`multidim_crawl.py` 是编排脚本**：按固定顺序**多次**调用 `weibospider/run_spider.py`，串起整条链路：**关键词召回 → 从 unified 抽 UID → 写 `input/user_ids.txt` → 用户资料 → 用户时间线**。中间「解析 unified、均衡抽样、维护 UID 池」由 `multidim_crawl.py` 自己在磁盘上完成，不经过 `run_spider.py`。
+- **`run_spider.py` 是单次爬取启动器**：每次进程只跑**一种** spider（由命令行 `mode` 决定），`process.start()` 阻塞到本次爬取结束即退出；数据落盘依赖 `settings.py` 中的 `pipelines.JsonWriterPipeline`，写入 `output/unified_*.jsonl`（及配套的 `user_aggregate_*.json` 等）。
+
+二者关系：**调用方 / 被调用方**——`multidim_crawl.py` 用子进程在 `weibospider` 工作目录下执行 `python run_spider.py <mode>`；Web 抓取（`app_web/app.py`）同样通过子进程调用 `run_spider.py`，但通常不跑 `multidim_crawl.py` 里的「先关键词再写 user_ids」那一段编排。
+
 ### 2.2 算法与流水线：`app_pipeline/`
 - `kmeans_prep.py`：步骤① 导出 `kmeans_tweets_input.jsonl`
 - `train_tweet_topic.py`：步骤② 聚类 + 训练（包含 GBDT）
@@ -29,13 +36,20 @@
 - `cluster_llm_labels.py`：步骤⑤ 簇深度命名（DeepSeek）
 - `merge_unified_to_bundle.py`：把多个 unified 合并为 `weibo_crawl_latest.json` 风格 bundle
 
+#### `tweet_text_normalize.py` 与 `feature_tweet_embeddings.py`（分工与依赖）
+
+- **`tweet_text_normalize`** 定「字面上算什么、怎么洗」：例如 `text_is_retweet`（转发占位是否过滤）、`clean_tweet_for_encode`（链接/@/话题/emoji 等与白名单清洗）。不读磁盘、不加载向量模型；`kmeans_prep` 等也会复用同一套规则，避免与嵌入链路「各洗各的」。
+- **`feature_tweet_embeddings`** 定「从哪读数据、怎么过滤、怎么变成向量」：经 `data_io` 读 bundle 或 `unified_*.jsonl`，做记录级过滤（如 `source_type`、大 V、过短正文等），再用 text2vec 对正文编码得到句向量。
+
+**依赖关系：**`feature_tweet_embeddings` **依赖** `tweet_text_normalize`。在 `feature_tweet_embeddings._append_tweet_from_record` 中顺序为：先 `text_is_retweet`，再 `clean_tweet_for_encode`；**只有通过这两步的文本才会进入编码**。
+
 ### 2.3 Web 服务与任务编排：`app_web/`
 - `run_web.py`：启动 FastAPI（`app_web/app.py:app`）
 - `app_web/app.py`：路由页面 + API + 后台任务线程 + 轮询 job 日志
 - `app_web/templates/*.html`：`/train`、`/profiles`、`/users/{id}` 等展示页面
 
 ### 2.4 终端总控脚本：根目录
-- `multidim_crawl.py`：把“关键词多圈层抓取 -> 抽样 UID -> 抓用户资料 -> 抓用户时间线”串联为一体
+- `multidim_crawl.py`：把「关键词多圈层抓取 → 抽样 UID → 抓用户资料 → 抓用户时间线」串联为一体（实现细节与和 `run_spider.py` 的关系见 **§2.1** 小节末段）
 
 ## 3) 主链路怎么跑（Web「训练 / 画像」步骤①～⑤）
 
