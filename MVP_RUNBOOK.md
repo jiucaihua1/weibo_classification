@@ -60,7 +60,7 @@ python run_web.py
 
 - `user` 信息采集
 - `tweet_by_user_id` 采集
-- `app_pipeline.train` 训练
+- `app_pipeline.train_tweet_topic` 训练
 - `app_pipeline.infer` 推断
 
 ## 4) Web 页面

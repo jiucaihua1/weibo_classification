@@ -1,7 +1,7 @@
 """
 与单条微博聚类（feature_tweet_embeddings / train_tweet_topic）一致的文本规范化。
 
-供数据清洗导出（clean_user_text）与嵌入流水线共用，避免两套规则漂移。
+供嵌入与聚类流水线（feature_tweet_embeddings / kmeans_prep 等）共用，避免规则漂移。
 """
 
 from __future__ import annotations

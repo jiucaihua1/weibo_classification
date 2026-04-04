@@ -2,6 +2,111 @@
 {% block title %}总览 · 微博兴趣看板{% endblock %}
 {% block page_pretitle %}本地优先{% endblock %}
 {% block page_title %}总览{% endblock %}
+{% block extra_head %}
+<style>
+  .dashboard-stat-card {
+    border: 1px solid rgba(15, 23, 42, 0.06);
+    border-radius: 14px;
+    overflow: hidden;
+    box-shadow: 0 8px 30px rgba(15, 23, 42, 0.06);
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+    background: #fff;
+  }
+  .dashboard-stat-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 14px 40px rgba(15, 23, 42, 0.1);
+  }
+  .dashboard-stat-card .stat-accent {
+    height: 4px;
+    border-radius: 14px 14px 0 0;
+  }
+  .dashboard-stat-card .stat-accent--indigo {
+    background: linear-gradient(90deg, #4f46e5, #818cf8);
+  }
+  .dashboard-stat-card .stat-accent--violet {
+    background: linear-gradient(90deg, #7c3aed, #a78bfa);
+  }
+  .dashboard-stat-card .stat-accent--teal {
+    background: linear-gradient(90deg, #0d9488, #2dd4bf);
+  }
+  .dashboard-stat-card .stat-accent--amber {
+    background: linear-gradient(90deg, #d97706, #fbbf24);
+  }
+  .dashboard-stat-card .card-body {
+    padding: 1.15rem 1.25rem 1.25rem;
+    background: linear-gradient(165deg, rgba(248, 250, 252, 0.9) 0%, #fff 55%);
+  }
+  .dashboard-stat-card .subheader {
+    color: #64748b;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+  }
+  .dashboard-stat-card .h1 {
+    color: #0f172a;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+  }
+  .dashboard-link-card {
+    border: 1px solid rgba(15, 23, 42, 0.07);
+    border-radius: 14px;
+    overflow: hidden;
+    box-shadow: 0 6px 24px rgba(15, 23, 42, 0.05);
+    transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+    background: #fff;
+  }
+  .dashboard-link-card:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 16px 40px rgba(15, 23, 42, 0.1);
+    border-color: rgba(79, 70, 229, 0.2);
+  }
+  .dashboard-link-card .link-icon-wrap {
+    width: 44px;
+    height: 44px;
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.35rem;
+    flex-shrink: 0;
+  }
+  .dashboard-link-card .link-icon-wrap--indigo { background: linear-gradient(135deg, rgba(79, 70, 229, 0.15), rgba(129, 140, 248, 0.08)); color: #4f46e5; }
+  .dashboard-link-card .link-icon-wrap--cyan { background: linear-gradient(135deg, rgba(6, 182, 212, 0.18), rgba(34, 211, 238, 0.08)); color: #0891b2; }
+  .dashboard-link-card .link-icon-wrap--violet { background: linear-gradient(135deg, rgba(124, 58, 237, 0.16), rgba(167, 139, 250, 0.08)); color: #7c3aed; }
+  .dashboard-link-card .link-icon-wrap--emerald { background: linear-gradient(135deg, rgba(16, 185, 129, 0.18), rgba(52, 211, 153, 0.08)); color: #059669; }
+  .dashboard-topic-card {
+    border: 1px solid rgba(15, 23, 42, 0.06);
+    border-radius: 14px;
+    overflow: hidden;
+    box-shadow: 0 8px 28px rgba(15, 23, 42, 0.06);
+  }
+  .dashboard-topic-card .card-header {
+    background: linear-gradient(120deg, #4f46e5 0%, #7c3aed 45%, #0d9488 100%);
+    color: #fff;
+    border-bottom: none;
+    padding: 1rem 1.25rem;
+  }
+  .dashboard-topic-card .card-header .card-title {
+    color: #fff;
+    font-weight: 600;
+  }
+  .dashboard-topic-card .card-header .btn-outline-primary {
+    color: #fff;
+    border-color: rgba(255, 255, 255, 0.45);
+    background: rgba(255, 255, 255, 0.12);
+  }
+  .dashboard-topic-card .card-header .btn-outline-primary:hover {
+    background: rgba(255, 255, 255, 0.22);
+    border-color: #fff;
+    color: #fff;
+  }
+  .dashboard-topic-row .progress {
+    background: rgba(15, 23, 42, 0.06);
+    border-radius: 6px;
+  }
+</style>
+{% endblock %}
 {% block page_sub %}
 <div class="text-secondary mt-1">
   <strong>当前主流程（终端）：</strong><code>multidim_crawl.py</code> — <strong>关键词召回</strong>（<code>tweet_by_keyword</code> → <code>output/unified_*.jsonl</code>）→ 抽样写入 <code>input/user_ids.txt</code> → <strong>用户资料</strong>（<code>user</code>）→ <strong>历史推文</strong>（<code>tweet_by_user_id</code>）。也可在「抓取微博」页仅按 UID 补拉时间线并生成 bundle。
@@ -11,7 +116,8 @@
 {% block content %}
 <div class="row row-deck row-cards mb-3">
   <div class="col-sm-6 col-lg-3">
-    <div class="card">
+    <div class="card dashboard-stat-card">
+      <div class="stat-accent stat-accent--indigo"></div>
       <div class="card-body">
         <div class="subheader">用户画像数</div>
         <div class="h1 mb-0">{{ workspace.profiles_count }}</div>
@@ -19,7 +125,8 @@
     </div>
   </div>
   <div class="col-sm-6 col-lg-3">
-    <div class="card">
+    <div class="card dashboard-stat-card">
+      <div class="stat-accent stat-accent--violet"></div>
       <div class="card-body">
         <div class="subheader">主话题种类数</div>
         <div class="h1 mb-0">{{ interest_distribution|length }}</div>
@@ -28,7 +135,8 @@
     </div>
   </div>
   <div class="col-sm-6 col-lg-3">
-    <div class="card">
+    <div class="card dashboard-stat-card">
+      <div class="stat-accent stat-accent--teal"></div>
       <div class="card-body">
         <div class="subheader">关键词用户池</div>
         <div class="h1 mb-0">{{ workspace.keyword_user_pool_count }}</div>
@@ -37,7 +145,8 @@
     </div>
   </div>
   <div class="col-sm-6 col-lg-3">
-    <div class="card">
+    <div class="card dashboard-stat-card">
+      <div class="stat-accent stat-accent--amber"></div>
       <div class="card-body d-flex flex-column">
         <div class="subheader">统一数据流 / Bundle</div>
         <div class="h1 mb-0">{% if workspace.unified_latest_file.exists or workspace.crawl_bundle.exists %}有数据{% else %}无{% endif %}</div>
@@ -177,40 +286,63 @@
 <div class="row g-3 mb-4">
   <div class="col-md-6 col-lg-4">
     <a href="/keyword-crawl" class="text-decoration-none text-reset">
-      <div class="card card-hover h-100">
+      <div class="card card-hover h-100 dashboard-link-card">
         <div class="card-body">
-          <div class="d-flex align-items-center gap-2 mb-2"><i class="ti ti-key text-primary"></i><span class="fw-semibold">关键词抓取</span></div>
-          <div class="text-secondary small">终端命令说明与本地产物路径。</div>
+          <div class="d-flex align-items-start gap-3 mb-2">
+            <div class="link-icon-wrap link-icon-wrap--indigo"><i class="ti ti-key"></i></div>
+            <div class="flex-fill min-w-0">
+              <span class="fw-semibold d-block text-dark">关键词抓取</span>
+              <div class="text-secondary small mt-1">终端命令说明与本地产物路径。</div>
+            </div>
+          </div>
         </div>
       </div>
     </a>
   </div>
   <div class="col-md-6 col-lg-4">
     <a href="/crawl" class="text-decoration-none text-reset">
-      <div class="card card-hover h-100">
+      <div class="card card-hover h-100 dashboard-link-card">
         <div class="card-body">
-          <div class="d-flex align-items-center gap-2 mb-2"><i class="ti ti-download text-primary"></i><span class="fw-semibold">抓取微博</span></div>
-          <div class="text-secondary small">按 UID 拉时间线，生成 <code>weibo_crawl_*.json</code>。</div>
+          <div class="d-flex align-items-start gap-3 mb-2">
+            <div class="link-icon-wrap link-icon-wrap--cyan"><i class="ti ti-download"></i></div>
+            <div class="flex-fill min-w-0">
+              <span class="fw-semibold d-block text-dark">抓取微博</span>
+              <div class="text-secondary small mt-1">按 UID 拉时间线，生成 <code>weibo_crawl_*.json</code>。</div>
+            </div>
+          </div>
         </div>
       </div>
     </a>
   </div>
   <div class="col-md-6 col-lg-4">
     <a href="/train" class="text-decoration-none text-reset">
-      <div class="card card-hover h-100">
+      <div class="card card-hover h-100 dashboard-link-card">
         <div class="card-body">
-          <div class="d-flex align-items-center gap-2 mb-2"><i class="ti ti-brain text-primary"></i><span class="fw-semibold">训练 / 画像</span></div>
-          <div class="text-secondary small">KMeans：① 导出清洗 jsonl → ② 聚类选 k → ③ 画像；含一键与 AI 命名。</div>
+          <div class="d-flex align-items-start gap-3 mb-2">
+            <div class="link-icon-wrap link-icon-wrap--violet"><i class="ti ti-brain"></i></div>
+            <div class="flex-fill min-w-0">
+              <span class="fw-semibold d-block text-dark">训练 / 画像</span>
+              <div class="text-secondary small mt-1">导出 jsonl → 聚类选 k → GBDT → 画像；含一键与 AI 命名。</div>
+            </div>
+          </div>
         </div>
       </div>
     </a>
   </div>
   <div class="col-md-6 col-lg-4">
     <a href="/personal-interest" class="text-decoration-none text-reset">
-      <div class="card card-hover h-100 border-secondary border-opacity-25">
+      <div class="card card-hover h-100 dashboard-link-card">
         <div class="card-body">
-          <div class="d-flex align-items-center gap-2 mb-2"><i class="ti ti-user-search text-secondary"></i><span class="fw-semibold text-secondary">个人兴趣预测</span> <span class="badge bg-secondary-lt">即将上线</span></div>
-          <div class="text-secondary small">单用户抓取 + 模型推断（占位）。</div>
+          <div class="d-flex align-items-start gap-3 mb-2">
+            <div class="link-icon-wrap link-icon-wrap--emerald"><i class="ti ti-user-search"></i></div>
+            <div class="flex-fill min-w-0">
+              <div class="d-flex flex-wrap align-items-center gap-2">
+                <span class="fw-semibold text-dark">个人兴趣预测</span>
+                <span class="badge bg-green-lt text-success">已上线</span>
+              </div>
+              <div class="text-secondary small mt-1">输入 UID，基于本地模型即时推断兴趣画像。</div>
+            </div>
+          </div>
         </div>
       </div>
     </a>
@@ -219,16 +351,35 @@
 
 <div class="row row-cards mb-4">
   <div class="col-12">
-    <div class="card">
+    <div class="card dashboard-topic-card">
       <div class="card-header d-flex flex-wrap align-items-center gap-2">
         <h3 class="card-title mb-0">主话题分布</h3>
         <a href="/profiles" class="btn btn-sm btn-outline-primary ms-auto">打开画像表</a>
       </div>
-      <div class="card-body">
+      <div class="card-body pt-3">
         {% if interest_distribution %}
-          <div class="d-flex flex-wrap gap-2">
-            {% for k, v in interest_distribution.items() %}
-              <span class="badge bg-secondary-lt">{{ k }} <span class="ms-1 fw-semibold">{{ v }}</span></span>
+          {% set topic_pairs = interest_distribution|dictsort(by='value', reverse=true) %}
+          {% set max_v = topic_pairs|map(attribute=1)|max %}
+          {% set denom = max_v if max_v > 0 else 1 %}
+          {% set bar_classes = ['bg-indigo', 'bg-azure', 'bg-teal', 'bg-violet', 'bg-cyan', 'bg-blue'] %}
+          {% set badge_hues = ['indigo', 'azure', 'teal', 'violet', 'cyan', 'blue'] %}
+          <div class="row g-3">
+            {% for k, v in topic_pairs %}
+              {% set pct = ((100 * v) / denom)|int %}
+              {% set hue = badge_hues[loop.index0 % 6] %}
+              {% set bar_cls = bar_classes[loop.index0 % 6] %}
+              <div class="col-12 col-md-6 col-xl-4">
+                <div class="dashboard-topic-row">
+                  <div class="d-flex justify-content-between align-items-baseline mb-1">
+                    <span class="small fw-medium text-dark text-truncate me-2" title="{{ k }}">{{ k }}</span>
+                    <span class="small fw-bold text-secondary text-nowrap">{{ v }}</span>
+                  </div>
+                  <div class="progress progress-sm mb-2" style="height: 10px;">
+                    <div class="progress-bar {{ bar_cls }}" style="width: {{ pct }}%;" role="progressbar" aria-valuenow="{{ pct }}" aria-valuemin="0" aria-valuemax="100"></div>
+                  </div>
+                  <span class="badge bg-{{ hue }}-lt">{{ k }} · {{ v }}</span>
+                </div>
+              </div>
             {% endfor %}
           </div>
         {% else %}

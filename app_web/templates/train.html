@@ -1,10 +1,10 @@
 {% extends "layout.html" %}
-{% block title %}聚类与画像 · 微博兴趣看板{% endblock %}
-{% block page_pretitle %}KMeans 流水线{% endblock %}
-{% block page_title %}聚类并生成画像{% endblock %}
+{% block title %}轻量级BERT-KMeans-GBDT · 微博兴趣看板{% endblock %}
+{% block page_pretitle %}{% endblock %}
+{% block page_title %}轻量级Bert-K-means聚类-用户多标签-GBDT分类{% endblock %}
 {% block page_sub %}
 <div class="text-secondary mt-1">
-  单按钮全流程：导出 <code>kmeans_tweets_input.jsonl</code> → 聚类选 k → 生成画像（infer）→ AI 深度命名（DeepSeek）。
+  单按钮全流程：导出 <code>kmeans_tweets_input.jsonl</code> → 文本向量化 + 聚类选 k → DeepSeek 簇命名 → GBDT 多标签分类 → 生成用户画像（infer）。
   默认输入：<code>{{ workspace.train_input_default }}</code>（优先步骤①产物，否则抓取 bundle / unified）。
 </div>
 {% endblock %}

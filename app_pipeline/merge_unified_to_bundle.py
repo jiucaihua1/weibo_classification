@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 from collections import defaultdict
@@ -56,24 +55,3 @@ def merge_paths(paths: List[str]) -> Tuple[Dict[str, Any], int, int]:
         "users": users,
     }
     return bundle, n_in, n_dup
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Merge unified jsonl files into crawl bundle JSON.")
-    ap.add_argument("jsonl", nargs="+", help="Paths to unified_*.jsonl")
-    ap.add_argument("-o", "--output", default="output/weibo_crawl_latest.json", help="Output bundle path")
-    args = ap.parse_args()
-    root = Path(__file__).resolve().parents[1]
-    out = Path(args.output)
-    if not out.is_absolute():
-        out = root / out
-    out.parent.mkdir(parents=True, exist_ok=True)
-    bundle, n_in, n_dup = merge_paths([str(Path(p).resolve()) for p in args.jsonl])
-    out.write_text(json.dumps(bundle, ensure_ascii=False), encoding="utf-8")
-    n_users = len(bundle["user_ids_order"])
-    n_records = sum(len(u["records"]) for u in bundle["users"])
-    print(f"[OK] lines_read={n_in} duplicates_skipped={n_dup} users={n_users} records={n_records} -> {out}")
-
-
-if __name__ == "__main__":
-    main()
